@@ -12,4 +12,4 @@ make
 
 ci builds on push and nightly. artifacts are in github actions.
 
-license: [MIT](/LICENSE)
+license: [MIT](/LICENSE), read for more.
