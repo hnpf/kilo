@@ -1,8 +1,8 @@
 # kilo
 
 text editor. wip: not recommended for use yet. 
-> [NOTE]
-> feel free to contribute and fork!
+> [PROJECT NOTE]
+> feel free to contribute and fork! todo will come soon.
 
 ## build
 
