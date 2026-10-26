@@ -1,6 +1,8 @@
 # kilo
 
-text editor. wip
+text editor. wip: not recommended for use yet. 
+> [NOTE]
+> feel free to contribute and fork!
 
 ## build
 
@@ -9,3 +11,5 @@ make
 ```
 
 ci builds on push and nightly. artifacts are in github actions.
+
+license: [MIT](/LICENSE)
