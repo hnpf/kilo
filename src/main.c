@@ -29,7 +29,8 @@ enum k {
 	K_S_DOWN,
 	K_S_LEFT,
 	K_S_RIGHT,
-	K_CMD
+	K_CMD,
+	K_REDO
 };
 
 // append buffer
@@ -52,6 +53,14 @@ struct th {
 	char sel[32];
 };
 
+// snapshot for undo/redo
+struct snap {
+	int nr;
+	struct r *r;
+	int cx;
+	int cy;
+};
+
 // editor state
 struct s {
 	struct termios o;
@@ -71,7 +80,12 @@ struct s {
 	time_t msg_t;
 	int dirty;
 	int quit_warn;
+	int in_type;
 	struct th th;
+	struct snap u_stack[128]; // undo
+	int u_len;
+	struct snap r_stack[128]; // redo
+	int r_len;
 };
 
 static struct s g;
@@ -94,8 +108,8 @@ static void b_free(struct b *b) {
 }
 
 static void rst(void) {
-	// disable mouse, exit alt screen, show cursor, restore term
-	const char s[] = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
+	// disable mouse, pop kitty keyboard, reset modifyOtherKeys, exit alt screen, show cursor, restore term
+	const char s[] = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[>4;0m\x1b[?1049l\x1b[?25h";
 	write(STDOUT_FILENO, s, sizeof(s) - 1);
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &g.o);
 }
@@ -115,6 +129,90 @@ static void msg(const char *fmt, ...) {
 	vsnprintf(g.msg, sizeof(g.msg), fmt, ap);
 	va_end(ap);
 	g.msg_t = time(NULL);
+}
+
+static void snap_free(struct snap *s) {
+	for (int i = 0; i < s->nr; i++) free(s->r[i].s);
+	free(s->r);
+	s->r = NULL;
+	s->nr = 0;
+}
+
+static void snap_clear_redo(void) {
+	for (int i = 0; i < g.r_len; i++) snap_free(&g.r_stack[i]);
+	g.r_len = 0;
+}
+
+static struct snap snap_curr(void) {
+	struct snap s;
+	s.nr = g.nr;
+	s.cx = g.cx;
+	s.cy = g.cy;
+	s.r = malloc(sizeof(struct r) * (g.nr > 0 ? g.nr : 1));
+	for (int i = 0; i < g.nr; i++) {
+		s.r[i].l = g.r[i].l;
+		s.r[i].s = malloc(g.r[i].l + 1);
+		memcpy(s.r[i].s, g.r[i].s, g.r[i].l);
+		s.r[i].s[g.r[i].l] = '\0';
+	}
+	return s;
+}
+
+static void snap_save(void) {
+	snap_clear_redo();
+	if (g.u_len >= 128) {
+		snap_free(&g.u_stack[0]);
+		memmove(&g.u_stack[0], &g.u_stack[1], sizeof(struct snap) * (g.u_len - 1));
+		g.u_len--;
+	}
+	g.u_stack[g.u_len++] = snap_curr();
+}
+
+static void snap_restore(struct snap *s) {
+	for (int i = 0; i < g.nr; i++) free(g.r[i].s);
+	free(g.r);
+
+	g.nr = s->nr;
+	g.cx = s->cx;
+	g.cy = s->cy;
+	g.sx = -1;
+	g.sy = -1;
+	g.r = malloc(sizeof(struct r) * (s->nr > 0 ? s->nr : 1));
+	for (int i = 0; i < s->nr; i++) {
+		g.r[i].l = s->r[i].l;
+		g.r[i].s = malloc(s->r[i].l + 1);
+		memcpy(g.r[i].s, s->r[i].s, s->r[i].l);
+		g.r[i].s[s->r[i].l] = '\0';
+	}
+	g.dirty = 1;
+}
+
+static void undo(void) {
+	if (g.u_len == 0) {
+		msg("already at oldest change");
+		return;
+	}
+	if (g.r_len < 128) {
+		g.r_stack[g.r_len++] = snap_curr();
+	}
+	struct snap s = g.u_stack[--g.u_len];
+	snap_restore(&s);
+	snap_free(&s);
+	msg("undo");
+}
+
+static void redo(void) {
+	if (g.r_len == 0) {
+		msg("already at newest change");
+		return;
+	}
+	if (g.u_len < 128) {
+		g.u_stack[g.u_len++] = snap_curr();
+	}
+	struct snap s = g.r_stack[--g.r_len];
+	snap_restore(&s);
+	snap_free(&s);
+	msg("redo");
 }
 
 static void add_r(int at, const char *s, size_t len) {
@@ -279,7 +377,19 @@ static char *b64_enc(const char *src, int len) {
 
 static void copy_sel(void) {
 	char *s = get_sel();
-	if (!s) return;
+	if (!s) {
+		// no selection: copy whole current line
+		if (g.cy < g.nr) {
+			int len = g.r[g.cy].l;
+			s = malloc(len + 2);
+			memcpy(s, g.r[g.cy].s, len);
+			s[len] = '\n';
+			s[len + 1] = '\0';
+		} else {
+			return;
+		}
+	}
+
 	free(g.clip);
 	g.clip = strdup(s);
 
@@ -331,6 +441,10 @@ static void del_sel(void) {
 }
 
 static void ins_c(int c) {
+	if (!g.in_type) {
+		snap_save();
+		g.in_type = 1;
+	}
 	if (g.sx != -1) del_sel();
 	if (g.cy == g.nr) add_r(g.nr, "", 0);
 	r_ins_c(&g.r[g.cy], g.cx, c);
@@ -338,6 +452,8 @@ static void ins_c(int c) {
 }
 
 static void ins_nl(void) {
+	g.in_type = 0;
+	snap_save();
 	if (g.sx != -1) del_sel();
 	if (g.cy == g.nr) {
 		add_r(g.nr, "", 0);
@@ -355,6 +471,8 @@ static void ins_nl(void) {
 }
 
 static void del_c(void) {
+	g.in_type = 0;
+	snap_save();
 	if (g.sx != -1) {
 		del_sel();
 		return;
@@ -376,6 +494,8 @@ static void del_c(void) {
 
 static void paste(void) {
 	if (!g.clip) return;
+	g.in_type = 0;
+	snap_save();
 	if (g.sx != -1) del_sel();
 	for (int i = 0; g.clip[i]; i++) {
 		if (g.clip[i] == '\r' || g.clip[i] == '\n') {
@@ -548,8 +668,8 @@ static void raw(void) {
 
 	signal(SIGWINCH, sig_winch);
 
-	// enter alt screen and enable SGR mouse tracking
-	const char enter_seq[] = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[H";
+	// enter alt screen, enable SGR mouse tracking, enable kitty disambiguate / modifyOtherKeys
+	const char enter_seq[] = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[>1u\x1b[>4;2m\x1b[H";
 	write(STDOUT_FILENO, enter_seq, sizeof(enter_seq) - 1);
 }
 
@@ -616,9 +736,19 @@ static int r_key(void) {
 			return 0;
 		}
 
-		// check for ctrl+; sequences (CSI u \x1b[59;5u or \x1b[27;5;59~)
-		if (!strcmp(seq, "[59;5u") || !strcmp(seq, "[27;5;59~") || !strcmp(seq, ";")) {
+		// check for ctrl+; sequences (CSI u, xterm modifyOtherKeys, or literal escape ;)
+		if (strstr(seq, "59;5") || strstr(seq, "59;6") || !strcmp(seq, ";") || !strcmp(seq, "O;")) {
 			return K_CMD;
+		}
+
+		// F1 key
+		if (!strcmp(seq, "OP") || !strcmp(seq, "[11~") || !strcmp(seq, "[[A")) {
+			return K_CMD;
+		}
+
+		// ctrl+shift+z (redo)
+		if (strstr(seq, "122;6") || strstr(seq, "90;6")) {
+			return K_REDO;
 		}
 
 		if (seq[0] == '[') {
@@ -747,7 +877,7 @@ static void cmd_menu(void) {
 				msg("unknown cmd: %s", buf);
 			}
 			break;
-		} else if (c == K_BACKSPACE || c == 8 || c == 127) {
+		} else if (c == K_BACKSPACE || c == 8) {
 			if (len > 0) buf[--len] = '\0';
 		} else if (isprint(c) && len < (int)sizeof(buf) - 1) {
 			buf[len++] = c;
@@ -772,7 +902,7 @@ int main(int argc, char **argv) {
 		opn(argv[1]);
 	}
 
-	msg("ctrl-s: save | ctrl-q: quit | ctrl-;: cmd menu");
+	msg("ctrl-s: save | ctrl-z/y: undo/redo | ctrl-;: cmd menu (f1)");
 
 	while (1) {
 		rfsh();
@@ -794,14 +924,31 @@ int main(int argc, char **argv) {
 			// mouse event handled in r_key
 			break;
 
-		// command menu: ctrl+; or ctrl+p
+		// undo: ctrl+z
+		case ('z' & 0x1f):
+			g.in_type = 0;
+			undo();
+			break;
+
+		// redo: ctrl+y or ctrl+shift+z
+		case ('y' & 0x1f):
+		case K_REDO:
+			g.in_type = 0;
+			redo();
+			break;
+
+		// command menu: ctrl+;, ctrl+p, f1, ctrl+\, ctrl+/
 		case K_CMD:
 		case ('p' & 0x1f):
+		case 28: // ctrl+backslash
+		case 31: // ctrl+/
+			g.in_type = 0;
 			cmd_menu();
 			break;
 
 		// save: ctrl+s
 		case ('s' & 0x1f):
+			g.in_type = 0;
 			sav();
 			break;
 
@@ -815,14 +962,25 @@ int main(int argc, char **argv) {
 			paste();
 			break;
 
-		// cut: ctrl+x
+		// cut: ctrl+x (cuts selection, or whole line if no selection)
 		case ('x' & 0x1f):
-			copy_sel();
-			del_sel();
+			g.in_type = 0;
+			snap_save();
+			if (g.sx != -1) {
+				copy_sel();
+				del_sel();
+			} else if (g.cy < g.nr) {
+				copy_sel();
+				del_r(g.cy);
+				if (g.cy >= g.nr && g.cy > 0) g.cy = g.nr - 1;
+				g.cx = 0;
+				msg("cut line");
+			}
 			break;
 
 		// select all: ctrl+a
 		case ('a' & 0x1f):
+			g.in_type = 0;
 			g.sx = 0;
 			g.sy = 0;
 			if (g.nr > 0) {
@@ -836,6 +994,7 @@ int main(int argc, char **argv) {
 		case K_S_DOWN:
 		case K_S_LEFT:
 		case K_S_RIGHT:
+			g.in_type = 0;
 			if (g.sx == -1) {
 				g.sx = g.cx;
 				g.sy = g.cy;
@@ -852,6 +1011,7 @@ int main(int argc, char **argv) {
 		case K_END:
 		case K_PGUP:
 		case K_PGDN:
+			g.in_type = 0;
 			g.sx = -1;
 			mv(c);
 			break;
@@ -866,6 +1026,8 @@ int main(int argc, char **argv) {
 			break;
 
 		case K_DEL:
+			g.in_type = 0;
+			snap_save();
 			if (g.sx != -1) {
 				del_sel();
 			} else {
@@ -875,6 +1037,7 @@ int main(int argc, char **argv) {
 			break;
 
 		case '\x1b':
+			g.in_type = 0;
 			g.sx = -1; // esc clears selection
 			break;
 
