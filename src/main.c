@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -30,6 +31,7 @@ enum k {
 	K_S_LEFT,
 	K_S_RIGHT,
 	K_CMD,
+	K_HELP,
 	K_REDO
 };
 
@@ -45,12 +47,14 @@ struct r {
 	char *s;
 };
 
-// theme
+// theme colors
 struct th {
 	char name[32];
 	char bg[32];
 	char fg[32];
 	char sel[32];
+	char ln[32];
+	char cur_ln[32];
 };
 
 // snapshot for undo/redo
@@ -81,6 +85,7 @@ struct s {
 	int dirty;
 	int quit_warn;
 	int in_type;
+	size_t file_sz;
 	struct th th;
 	struct snap u_stack[128]; // undo
 	int u_len;
@@ -107,9 +112,21 @@ static void b_free(struct b *b) {
 	free(b->p);
 }
 
+static int hex_rgb(const char *hex, int *r, int *g, int *b) {
+	if (!hex || hex[0] != '#') return 0;
+	unsigned int ur, ug, ub;
+	if (sscanf(hex + 1, "%02x%02x%02x", &ur, &ug, &ub) == 3) {
+		*r = (int)ur;
+		*g = (int)ug;
+		*b = (int)ub;
+		return 1;
+	}
+	return 0;
+}
+
 static void rst(void) {
-	// disable mouse, pop kitty keyboard, reset modifyOtherKeys, exit alt screen, show cursor, restore term
-	const char s[] = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[>4;0m\x1b[?1049l\x1b[?25h";
+	// reset colors, disable mouse, pop kitty keyboard, reset modifyOtherKeys, exit alt screen, show cursor, restore term
+	const char s[] = "\x1b[0m\x1b[49m\x1b[39m\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[>4;0m\x1b[?1049l\x1b[?25h";
 	write(STDOUT_FILENO, s, sizeof(s) - 1);
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &g.o);
 }
@@ -266,6 +283,11 @@ static void opn(const char *fn) {
 	FILE *fp = fopen(fn, "r");
 	if (!fp) return;
 
+	struct stat st;
+	if (fstat(fileno(fp), &st) == 0) {
+		g.file_sz = st.st_size;
+	}
+
 	char *line = NULL;
 	size_t cap = 0;
 	ssize_t len;
@@ -304,6 +326,7 @@ static void sav(void) {
 				close(fd);
 				free(buf);
 				g.dirty = 0;
+				g.file_sz = len;
 				msg("%d bytes written", len);
 				return;
 			}
@@ -528,6 +551,8 @@ static void load_th(const char *name) {
 			if (!strcmp(key, "background")) snprintf(g.th.bg, sizeof(g.th.bg), "%s", val);
 			else if (!strcmp(key, "foreground")) snprintf(g.th.fg, sizeof(g.th.fg), "%s", val);
 			else if (!strcmp(key, "selection")) snprintf(g.th.sel, sizeof(g.th.sel), "%s", val);
+			else if (!strcmp(key, "line_number")) snprintf(g.th.ln, sizeof(g.th.ln), "%s", val);
+			else if (!strcmp(key, "current_line_nr")) snprintf(g.th.cur_ln, sizeof(g.th.cur_ln), "%s", val);
 		}
 	}
 	fclose(fp);
@@ -558,59 +583,136 @@ static void rfsh(void) {
 	b_add(&b, "\x1b[?25l", 6);
 	b_add(&b, "\x1b[H", 3);
 
-	// draw file lines or tildes
+	// apply theme bg & fg
+	int r, gr, bl;
+	if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) {
+		b_add(&b, "\x1b[49m", 5);
+	} else if (hex_rgb(g.th.bg, &r, &gr, &bl)) {
+		char cbuf[32];
+		int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
+		b_add(&b, cbuf, clen);
+	}
+
+	if (hex_rgb(g.th.fg, &r, &gr, &bl)) {
+		char cbuf[32];
+		int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
+		b_add(&b, cbuf, clen);
+	} else {
+		b_add(&b, "\x1b[39m", 5);
+	}
+
+	// selection ANSI
+	char sel_on[32];
+	if (hex_rgb(g.th.sel, &r, &gr, &bl)) {
+		snprintf(sel_on, sizeof(sel_on), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
+	} else {
+		strcpy(sel_on, "\x1b[7m");
+	}
+
+	// gutter width for line numbers
+	int ln_w = 1;
+	int temp = g.nr;
+	while (temp >= 10) { ln_w++; temp /= 10; }
+	if (ln_w < 3) ln_w = 3;
+	int gutter = ln_w + 3; // e.g. " 12 │ "
+	int text_w = g.w - gutter;
+	if (text_w < 1) text_w = 1;
+
+	// draw file lines
 	for (int y = 0; y < g.h; y++) {
 		int filerow = y + g.rowoff;
+
+		// line number gutter
+		if (filerow < g.nr) {
+			int cur = (filerow == g.cy);
+			if (cur && hex_rgb(g.th.cur_ln, &r, &gr, &bl)) {
+				char cbuf[32];
+				int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
+				b_add(&b, cbuf, clen);
+			} else if (!cur && hex_rgb(g.th.ln, &r, &gr, &bl)) {
+				char cbuf[32];
+				int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
+				b_add(&b, cbuf, clen);
+			} else {
+				b_add(&b, cur ? "\x1b[1;33m" : "\x1b[90m", cur ? 7 : 5);
+			}
+
+			char numbuf[32];
+			int nlen = snprintf(numbuf, sizeof(numbuf), "%*d │ ", ln_w, filerow + 1);
+			b_add(&b, numbuf, nlen);
+
+			// restore theme fg
+			if (hex_rgb(g.th.fg, &r, &gr, &bl)) {
+				char cbuf[32];
+				int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
+				b_add(&b, cbuf, clen);
+			} else {
+				b_add(&b, "\x1b[39m", 5);
+			}
+		} else {
+			b_add(&b, "\x1b[90m", 5);
+			for (int p = 0; p < ln_w; p++) b_add(&b, " ", 1);
+			b_add(&b, " ~ ", 3);
+			b_add(&b, "\x1b[m", 3);
+		}
+
 		if (filerow >= g.nr) {
 			if (g.nr == 0 && y == g.h / 3) {
 				char welc[80];
 				int welclen = snprintf(welc, sizeof(welc),
 					"kilo editor -- version %s", KILO_VER);
-				if (welclen > g.w) welclen = g.w;
-				int pad = (g.w - welclen) / 2;
-				if (pad) {
-					b_add(&b, "~", 1);
-					pad--;
-				}
-				while (pad--) b_add(&b, " ", 1);
+				if (welclen > text_w) welclen = text_w;
+				int pad = (text_w - welclen) / 2;
+				while (pad-- > 0) b_add(&b, " ", 1);
 				b_add(&b, welc, welclen);
-			} else {
-				b_add(&b, "~", 1);
 			}
 		} else {
 			int len = g.r[filerow].l - g.coloff;
 			if (len < 0) len = 0;
-			if (len > g.w) len = g.w;
+			if (len > text_w) len = text_w;
 			int in_highlight = 0;
 			for (int j = 0; j < len; j++) {
 				int col = j + g.coloff;
 				int sel = in_sel(filerow, col);
 				if (sel && !in_highlight) {
-					b_add(&b, "\x1b[7m", 4); // inverse for selection
+					b_add(&b, sel_on, strlen(sel_on));
 					in_highlight = 1;
 				} else if (!sel && in_highlight) {
-					b_add(&b, "\x1b[m", 3);
+					// restore normal bg
+					if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) {
+						b_add(&b, "\x1b[49m", 5);
+					} else if (hex_rgb(g.th.bg, &r, &gr, &bl)) {
+						char cbuf[32];
+						int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
+						b_add(&b, cbuf, clen);
+					} else {
+						b_add(&b, "\x1b[m", 3);
+					}
 					in_highlight = 0;
 				}
 				b_add(&b, &g.r[filerow].s[col], 1);
 			}
-			if (in_highlight) b_add(&b, "\x1b[m", 3);
+			if (in_highlight) {
+				if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) b_add(&b, "\x1b[49m", 5);
+				else b_add(&b, "\x1b[m", 3);
+			}
 		}
 
 		b_add(&b, "\x1b[K", 3);
 		b_add(&b, "\r\n", 2);
 	}
 
-	// status bar (inverted colors)
+	// status bar (inverted colors / file info)
 	b_add(&b, "\x1b[7m", 4);
-	char status[80], rstatus[80];
-	int len = snprintf(status, sizeof(status), " %.20s%s - %d lines [%s]",
+	char status[128], rstatus[128];
+	int len = snprintf(status, sizeof(status), " %.20s%s | %d lines, %zuB | unix (LF) | utf-8",
 		g.fn ? g.fn : "[no name]",
 		g.dirty ? " *" : "",
 		g.nr,
+		g.file_sz);
+	int rlen = snprintf(rstatus, sizeof(rstatus), "ln %d, col %d [%s] ",
+		g.cy + 1, g.cx + 1,
 		g.th.name[0] ? g.th.name : "base16");
-	int rlen = snprintf(rstatus, sizeof(rstatus), "%d:%d ",
-		g.cy + 1, g.cx + 1);
 	if (len > g.w) len = g.w;
 	b_add(&b, status, len);
 	while (len < g.w) {
@@ -632,9 +734,9 @@ static void rfsh(void) {
 		b_add(&b, g.msg, msglen);
 	}
 
-	// move cursor to cx, cy relative to viewport
+	// move cursor to cx, cy relative to viewport + gutter
 	char buf[32];
-	int cx = g.cx - g.coloff;
+	int cx = (g.cx - g.coloff) + gutter;
 	int cy = g.cy - g.rowoff;
 	int curlen = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cy + 1, cx + 1);
 	b_add(&b, buf, curlen);
@@ -691,11 +793,38 @@ static int r_key(void) {
 
 		if (idx == 0) return '\x1b';
 
+		// alt+g: \x1bg
+		if (idx == 1 && seq[0] == 'g') return K_HELP;
+
+		// CSI u keyboard reporting (\x1b[<codepoint>;<mod>u)
+		if (seq[0] == '[') {
+			int key = 0, mod = 0;
+			if (sscanf(seq, "[%d;%du", &key, &mod) == 2) {
+				if (mod == 5 || mod == 7) { // Ctrl or Ctrl+Alt
+					if (key >= 'a' && key <= 'z') return key - 'a' + 1;
+					if (key >= 'A' && key <= 'Z') return key - 'A' + 1;
+					if (key == ';') return K_CMD;
+					if (key == 'g') return K_HELP;
+				}
+				if (mod == 6) { // Ctrl+Shift
+					if (key == 'z' || key == 'Z') return K_REDO;
+					if (key >= 'a' && key <= 'z') return key - 'a' + 1;
+				}
+				if (key == ';') return K_CMD;
+			}
+		}
+
 		// mouse report \x1b[<b;x;yM
 		if (seq[0] == '[' && seq[1] == '<') {
 			int b, mx, my;
 			char mtype = 0;
 			if (sscanf(&seq[2], "%d;%d;%d%c", &b, &mx, &my, &mtype) >= 3) {
+				int ln_w = 1;
+				int temp = g.nr;
+				while (temp >= 10) { ln_w++; temp /= 10; }
+				if (ln_w < 3) ln_w = 3;
+				int gutter = ln_w + 3;
+
 				if (b == 64) {
 					// scroll up
 					for (int i = 0; i < 3; i++) {
@@ -711,7 +840,8 @@ static int r_key(void) {
 				} else if (b == 0 && mtype == 'M') {
 					// left click
 					g.cy = (my - 1) + g.rowoff;
-					g.cx = (mx - 1) + g.coloff;
+					g.cx = (mx - 1 - gutter) + g.coloff;
+					if (g.cx < 0) g.cx = 0;
 					if (g.cy > g.nr) g.cy = g.nr;
 					struct r *cur = (g.cy < g.nr) ? &g.r[g.cy] : NULL;
 					int rowlen = cur ? cur->l : 0;
@@ -725,7 +855,8 @@ static int r_key(void) {
 						g.sy = g.cy;
 					}
 					g.cy = (my - 1) + g.rowoff;
-					g.cx = (mx - 1) + g.coloff;
+					g.cx = (mx - 1 - gutter) + g.coloff;
+					if (g.cx < 0) g.cx = 0;
 					if (g.cy > g.nr) g.cy = g.nr;
 					struct r *cur = (g.cy < g.nr) ? &g.r[g.cy] : NULL;
 					int rowlen = cur ? cur->l : 0;
@@ -743,7 +874,7 @@ static int r_key(void) {
 
 		// F1 key
 		if (!strcmp(seq, "OP") || !strcmp(seq, "[11~") || !strcmp(seq, "[[A")) {
-			return K_CMD;
+			return K_HELP;
 		}
 
 		// ctrl+shift+z (redo)
@@ -847,6 +978,54 @@ static void mv(int key) {
 	if (g.cx > rowlen) g.cx = rowlen;
 }
 
+static void show_help(void) {
+	while (1) {
+		struct b b = {0};
+		b_add(&b, "\x1b[?25l\x1b[H", 9);
+
+		const char *lines[] = {
+			"┌─── kilo help (esc to close) ──────────────────────┐",
+			"│                                                   │",
+			"│  navigation                  editing              │",
+			"│  arrows / home / end         ctrl+s  save         │",
+			"│  pgup / pgdn                 ctrl+z  undo         │",
+			"│                              ctrl+y  redo         │",
+			"│  selection                   ctrl+c  copy line/sel│",
+			"│  shift+arrows / mouse drag   ctrl+x  cut line/sel │",
+			"│  ctrl+a       select all     ctrl+v  paste        │",
+			"│                                                   │",
+			"│  menus & help                                     │",
+			"│  ctrl+;       cmd / themes   ctrl+g  help overlay │",
+			"│  alt+g        keybindings    ctrl+q  quit editor  │",
+			"└───────────────────────────────────────────────────┘"
+		};
+		int nlines = sizeof(lines) / sizeof(lines[0]);
+		int start_y = (g.h > nlines) ? (g.h - nlines) / 2 : 0;
+
+		for (int y = 0; y < g.h + 2; y++) {
+			b_add(&b, "\x1b[K", 3);
+			if (y >= start_y && y < start_y + nlines) {
+				int lidx = y - start_y;
+				int len = strlen(lines[lidx]);
+				int pad = (g.w > len) ? (g.w - len) / 2 : 0;
+				for (int p = 0; p < pad; p++) b_add(&b, " ", 1);
+				b_add(&b, "\x1b[1;36m", 7);
+				b_add(&b, lines[lidx], len);
+				b_add(&b, "\x1b[m", 3);
+			}
+			if (y < g.h + 1) b_add(&b, "\r\n", 2);
+		}
+
+		write(STDOUT_FILENO, b.p, b.l);
+		b_free(&b);
+
+		int c = r_key();
+		if (c == '\x1b' || c == ('g' & 0x1f) || c == ('q' & 0x1f) || c == '\r' || c == ' ' || c == K_HELP) {
+			break;
+		}
+	}
+}
+
 static void cmd_menu(void) {
 	char buf[80] = {0};
 	int len = 0;
@@ -873,6 +1052,8 @@ static void cmd_menu(void) {
 				sav();
 			} else if (!strncmp(buf, "theme ", 6)) {
 				load_th(buf + 6);
+			} else if (!strcmp(buf, "q") || !strcmp(buf, "quit")) {
+				exit(0);
 			} else {
 				msg("unknown cmd: %s", buf);
 			}
@@ -902,7 +1083,7 @@ int main(int argc, char **argv) {
 		opn(argv[1]);
 	}
 
-	msg("ctrl-s: save | ctrl-z/y: undo/redo | ctrl-;: cmd menu (f1)");
+	msg("ctrl-s: save | ctrl-z/y: undo/redo | ctrl-g: help | ctrl-;: menu");
 
 	while (1) {
 		rfsh();
@@ -924,6 +1105,12 @@ int main(int argc, char **argv) {
 			// mouse event handled in r_key
 			break;
 
+		// help: ctrl+g, alt+g, f1
+		case ('g' & 0x1f):
+		case K_HELP:
+			show_help();
+			break;
+
 		// undo: ctrl+z
 		case ('z' & 0x1f):
 			g.in_type = 0;
@@ -937,7 +1124,7 @@ int main(int argc, char **argv) {
 			redo();
 			break;
 
-		// command menu: ctrl+;, ctrl+p, f1, ctrl+\, ctrl+/
+		// command menu: ctrl+;, ctrl+p, ctrl+backslash, ctrl+/
 		case K_CMD:
 		case ('p' & 0x1f):
 		case 28: // ctrl+backslash
