@@ -1,4 +1,6 @@
+#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -13,6 +15,7 @@
 
 enum k {
 	K_ESC = 27,
+	K_BACKSPACE = 127,
 	K_UP = 1000,
 	K_DOWN,
 	K_LEFT,
@@ -21,7 +24,12 @@ enum k {
 	K_END,
 	K_PGUP,
 	K_PGDN,
-	K_DEL
+	K_DEL,
+	K_S_UP,
+	K_S_DOWN,
+	K_S_LEFT,
+	K_S_RIGHT,
+	K_CMD
 };
 
 // append buffer
@@ -36,11 +44,21 @@ struct r {
 	char *s;
 };
 
+// theme
+struct th {
+	char name[32];
+	char bg[32];
+	char fg[32];
+	char sel[32];
+};
+
 // editor state
 struct s {
 	struct termios o;
 	int cx;
 	int cy;
+	int sx; // selection anchor x (-1 = no selection)
+	int sy; // selection anchor y
 	int rowoff;
 	int coloff;
 	int w;
@@ -48,9 +66,12 @@ struct s {
 	int nr;
 	struct r *r;
 	char *fn;
+	char *clip;
 	char msg[80];
 	time_t msg_t;
 	int dirty;
+	int quit_warn;
+	struct th th;
 };
 
 static struct s g;
@@ -73,8 +94,9 @@ static void b_free(struct b *b) {
 }
 
 static void rst(void) {
-	// exit alt screen, show cursor, restore term
-	write(STDOUT_FILENO, "\x1b[?1049l\x1b[?25h", 14);
+	// disable mouse, exit alt screen, show cursor, restore term
+	const char s[] = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
+	write(STDOUT_FILENO, s, sizeof(s) - 1);
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &g.o);
 }
 
@@ -95,13 +117,48 @@ static void msg(const char *fmt, ...) {
 	g.msg_t = time(NULL);
 }
 
-static void add_r(const char *s, size_t len) {
+static void add_r(int at, const char *s, size_t len) {
+	if (at < 0 || at > g.nr) return;
 	g.r = realloc(g.r, sizeof(struct r) * (g.nr + 1));
-	g.r[g.nr].l = (int)len;
-	g.r[g.nr].s = malloc(len + 1);
-	memcpy(g.r[g.nr].s, s, len);
-	g.r[g.nr].s[len] = '\0';
+	memmove(&g.r[at + 1], &g.r[at], sizeof(struct r) * (g.nr - at));
+	g.r[at].l = (int)len;
+	g.r[at].s = malloc(len + 1);
+	memcpy(g.r[at].s, s, len);
+	g.r[at].s[len] = '\0';
 	g.nr++;
+	g.dirty = 1;
+}
+
+static void del_r(int at) {
+	if (at < 0 || at >= g.nr) return;
+	free(g.r[at].s);
+	memmove(&g.r[at], &g.r[at + 1], sizeof(struct r) * (g.nr - at - 1));
+	g.nr--;
+	g.dirty = 1;
+}
+
+static void r_ins_c(struct r *row, int at, int c) {
+	if (at < 0 || at > row->l) at = row->l;
+	row->s = realloc(row->s, row->l + 2);
+	memmove(&row->s[at + 1], &row->s[at], row->l - at + 1);
+	row->l++;
+	row->s[at] = c;
+	g.dirty = 1;
+}
+
+static void r_del_c(struct r *row, int at) {
+	if (at < 0 || at >= row->l) return;
+	memmove(&row->s[at], &row->s[at + 1], row->l - at);
+	row->l--;
+	g.dirty = 1;
+}
+
+static void r_app_s(struct r *row, const char *s, size_t len) {
+	row->s = realloc(row->s, row->l + len + 1);
+	memcpy(&row->s[row->l], s, len);
+	row->l += len;
+	row->s[row->l] = '\0';
+	g.dirty = 1;
 }
 
 static void opn(const char *fn) {
@@ -117,10 +174,244 @@ static void opn(const char *fn) {
 	while ((len = getline(&line, &cap, fp)) != -1) {
 		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 			len--;
-		add_r(line, len);
+		add_r(g.nr, line, len);
 	}
 	free(line);
 	fclose(fp);
+	g.dirty = 0;
+}
+
+static void sav(void) {
+	if (!g.fn) {
+		msg("no filename");
+		return;
+	}
+
+	int len = 0;
+	for (int i = 0; i < g.nr; i++) {
+		len += g.r[i].l + 1;
+	}
+	char *buf = malloc(len + 1);
+	char *p = buf;
+	for (int i = 0; i < g.nr; i++) {
+		memcpy(p, g.r[i].s, g.r[i].l);
+		p += g.r[i].l;
+		*p++ = '\n';
+	}
+
+	int fd = open(g.fn, O_RDWR | O_CREAT, 0644);
+	if (fd != -1) {
+		if (ftruncate(fd, len) != -1) {
+			if (write(fd, buf, len) == len) {
+				close(fd);
+				free(buf);
+				g.dirty = 0;
+				msg("%d bytes written", len);
+				return;
+			}
+		}
+		close(fd);
+	}
+	free(buf);
+	msg("save error: %s", strerror(errno));
+}
+
+// selection helpers
+static void sel_bounds(int *y1, int *x1, int *y2, int *x2) {
+	if (g.sy < g.cy || (g.sy == g.cy && g.sx <= g.cx)) {
+		*y1 = g.sy; *x1 = g.sx;
+		*y2 = g.cy; *x2 = g.cx;
+	} else {
+		*y1 = g.cy; *x1 = g.cx;
+		*y2 = g.sy; *x2 = g.sx;
+	}
+}
+
+static int in_sel(int y, int x) {
+	if (g.sx == -1) return 0;
+	int y1, x1, y2, x2;
+	sel_bounds(&y1, &x1, &y2, &x2);
+	if (y < y1 || y > y2) return 0;
+	if (y == y1 && y == y2) return x >= x1 && x < x2;
+	if (y == y1) return x >= x1;
+	if (y == y2) return x < x2;
+	return 1;
+}
+
+static char *get_sel(void) {
+	if (g.sx == -1) return NULL;
+	int y1, x1, y2, x2;
+	sel_bounds(&y1, &x1, &y2, &x2);
+	if (y1 == y2 && x1 == x2) return NULL;
+
+	struct b b = {0};
+	for (int y = y1; y <= y2 && y < g.nr; y++) {
+		int start = (y == y1) ? x1 : 0;
+		int end = (y == y2) ? x2 : g.r[y].l;
+		if (start < g.r[y].l) {
+			if (end > g.r[y].l) end = g.r[y].l;
+			if (end > start) b_add(&b, &g.r[y].s[start], end - start);
+		}
+		if (y < y2) b_add(&b, "\n", 1);
+	}
+	b_add(&b, "\0", 1);
+	return b.p;
+}
+
+// b64 encoder for osc 52
+static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static char *b64_enc(const char *src, int len) {
+	int outlen = 4 * ((len + 2) / 3);
+	char *out = malloc(outlen + 1);
+	int i = 0, j = 0;
+	while (i < len) {
+		int a = (unsigned char)src[i++];
+		int b = i < len ? (unsigned char)src[i++] : 0;
+		int c = i < len ? (unsigned char)src[i++] : 0;
+		out[j++] = b64[(a >> 2) & 0x3f];
+		out[j++] = b64[((a & 3) << 4) | (b >> 4)];
+		out[j++] = (i > len + 1) ? '=' : b64[((b & 0xf) << 2) | (c >> 6)];
+		out[j++] = (i > len) ? '=' : b64[c & 0x3f];
+	}
+	out[j] = '\0';
+	return out;
+}
+
+static void copy_sel(void) {
+	char *s = get_sel();
+	if (!s) return;
+	free(g.clip);
+	g.clip = strdup(s);
+
+	// osc 52
+	char *enc = b64_enc(s, strlen(s));
+	write(STDOUT_FILENO, "\x1b]52;c;", 7);
+	write(STDOUT_FILENO, enc, strlen(enc));
+	write(STDOUT_FILENO, "\x07", 1);
+	free(enc);
+
+	// system clipboard fallback
+	FILE *p = popen("wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null", "w");
+	if (p) {
+		fputs(s, p);
+		pclose(p);
+	}
+
+	msg("copied %zu bytes", strlen(s));
+	free(s);
+}
+
+static void del_sel(void) {
+	if (g.sx == -1) return;
+	int y1, x1, y2, x2;
+	sel_bounds(&y1, &x1, &y2, &x2);
+	if (y1 == y2 && x1 == x2) {
+		g.sx = -1;
+		return;
+	}
+
+	if (y1 == y2) {
+		if (y1 < g.nr) {
+			memmove(&g.r[y1].s[x1], &g.r[y1].s[x2], g.r[y1].l - x2 + 1);
+			g.r[y1].l -= (x2 - x1);
+		}
+	} else {
+		if (y1 < g.nr && y2 < g.nr) {
+			g.r[y1].l = x1;
+			g.r[y1].s[x1] = '\0';
+			r_app_s(&g.r[y1], &g.r[y2].s[x2], g.r[y2].l - x2);
+			for (int y = y2; y > y1; y--) del_r(y);
+		}
+	}
+
+	g.cy = y1;
+	g.cx = x1;
+	g.sx = -1;
+	g.dirty = 1;
+}
+
+static void ins_c(int c) {
+	if (g.sx != -1) del_sel();
+	if (g.cy == g.nr) add_r(g.nr, "", 0);
+	r_ins_c(&g.r[g.cy], g.cx, c);
+	g.cx++;
+}
+
+static void ins_nl(void) {
+	if (g.sx != -1) del_sel();
+	if (g.cy == g.nr) {
+		add_r(g.nr, "", 0);
+	} else if (g.cx == 0) {
+		add_r(g.cy, "", 0);
+	} else {
+		struct r *row = &g.r[g.cy];
+		add_r(g.cy + 1, &row->s[g.cx], row->l - g.cx);
+		row = &g.r[g.cy];
+		row->l = g.cx;
+		row->s[row->l] = '\0';
+	}
+	g.cy++;
+	g.cx = 0;
+}
+
+static void del_c(void) {
+	if (g.sx != -1) {
+		del_sel();
+		return;
+	}
+	if (g.cy == g.nr) return;
+	if (g.cx == 0 && g.cy == 0) return;
+
+	struct r *row = &g.r[g.cy];
+	if (g.cx > 0) {
+		r_del_c(row, g.cx - 1);
+		g.cx--;
+	} else {
+		g.cx = g.r[g.cy - 1].l;
+		r_app_s(&g.r[g.cy - 1], row->s, row->l);
+		del_r(g.cy);
+		g.cy--;
+	}
+}
+
+static void paste(void) {
+	if (!g.clip) return;
+	if (g.sx != -1) del_sel();
+	for (int i = 0; g.clip[i]; i++) {
+		if (g.clip[i] == '\r' || g.clip[i] == '\n') {
+			ins_nl();
+		} else {
+			ins_c(g.clip[i]);
+		}
+	}
+}
+
+static void load_th(const char *name) {
+	char path[128];
+	snprintf(path, sizeof(path), "themes/%s.conf", name);
+	FILE *fp = fopen(path, "r");
+	if (!fp) {
+		snprintf(path, sizeof(path), "/etc/kilo/themes/%s.conf", name);
+		fp = fopen(path, "r");
+	}
+	if (!fp) {
+		msg("theme not found: %s", name);
+		return;
+	}
+
+	strncpy(g.th.name, name, sizeof(g.th.name) - 1);
+	char line[128];
+	while (fgets(line, sizeof(line), fp)) {
+		char key[32], val[32];
+		if (sscanf(line, " %31[^= ] = \"%31[^\"]\"", key, val) == 2 ||
+		    sscanf(line, " %31[^= ] = %31s", key, val) == 2) {
+			if (!strcmp(key, "background")) snprintf(g.th.bg, sizeof(g.th.bg), "%s", val);
+			else if (!strcmp(key, "foreground")) snprintf(g.th.fg, sizeof(g.th.fg), "%s", val);
+			else if (!strcmp(key, "selection")) snprintf(g.th.sel, sizeof(g.th.sel), "%s", val);
+		}
+	}
+	fclose(fp);
+	msg("theme: %s", name);
 }
 
 static void scrl(void) {
@@ -170,9 +461,20 @@ static void rfsh(void) {
 			int len = g.r[filerow].l - g.coloff;
 			if (len < 0) len = 0;
 			if (len > g.w) len = g.w;
-			if (len > 0) {
-				b_add(&b, &g.r[filerow].s[g.coloff], len);
+			int in_highlight = 0;
+			for (int j = 0; j < len; j++) {
+				int col = j + g.coloff;
+				int sel = in_sel(filerow, col);
+				if (sel && !in_highlight) {
+					b_add(&b, "\x1b[7m", 4); // inverse for selection
+					in_highlight = 1;
+				} else if (!sel && in_highlight) {
+					b_add(&b, "\x1b[m", 3);
+					in_highlight = 0;
+				}
+				b_add(&b, &g.r[filerow].s[col], 1);
 			}
+			if (in_highlight) b_add(&b, "\x1b[m", 3);
 		}
 
 		b_add(&b, "\x1b[K", 3);
@@ -182,10 +484,11 @@ static void rfsh(void) {
 	// status bar (inverted colors)
 	b_add(&b, "\x1b[7m", 4);
 	char status[80], rstatus[80];
-	int len = snprintf(status, sizeof(status), " %.20s%s - %d lines",
+	int len = snprintf(status, sizeof(status), " %.20s%s - %d lines [%s]",
 		g.fn ? g.fn : "[no name]",
 		g.dirty ? " *" : "",
-		g.nr);
+		g.nr,
+		g.th.name[0] ? g.th.name : "base16");
 	int rlen = snprintf(rstatus, sizeof(rstatus), "%d:%d ",
 		g.cy + 1, g.cx + 1);
 	if (len > g.w) len = g.w;
@@ -245,8 +548,9 @@ static void raw(void) {
 
 	signal(SIGWINCH, sig_winch);
 
-	// enter alt screen
-	write(STDOUT_FILENO, "\x1b[?1049h\x1b[H", 11);
+	// enter alt screen and enable SGR mouse tracking
+	const char enter_seq[] = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[H";
+	write(STDOUT_FILENO, enter_seq, sizeof(enter_seq) - 1);
 }
 
 static int r_key(void) {
@@ -257,14 +561,75 @@ static int r_key(void) {
 	}
 
 	if (c == '\x1b') {
-		char seq[3];
-		if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
-		if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+		char seq[64];
+		int idx = 0;
+		while (idx < 63 && read(STDIN_FILENO, &seq[idx], 1) == 1) {
+			char ch = seq[idx++];
+			if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '~') break;
+		}
+		seq[idx] = '\0';
+
+		if (idx == 0) return '\x1b';
+
+		// mouse report \x1b[<b;x;yM
+		if (seq[0] == '[' && seq[1] == '<') {
+			int b, mx, my;
+			char mtype = 0;
+			if (sscanf(&seq[2], "%d;%d;%d%c", &b, &mx, &my, &mtype) >= 3) {
+				if (b == 64) {
+					// scroll up
+					for (int i = 0; i < 3; i++) {
+						if (g.cy > 0) g.cy--;
+					}
+					return 0;
+				} else if (b == 65) {
+					// scroll down
+					for (int i = 0; i < 3; i++) {
+						if (g.cy < g.nr) g.cy++;
+					}
+					return 0;
+				} else if (b == 0 && mtype == 'M') {
+					// left click
+					g.cy = (my - 1) + g.rowoff;
+					g.cx = (mx - 1) + g.coloff;
+					if (g.cy > g.nr) g.cy = g.nr;
+					struct r *cur = (g.cy < g.nr) ? &g.r[g.cy] : NULL;
+					int rowlen = cur ? cur->l : 0;
+					if (g.cx > rowlen) g.cx = rowlen;
+					g.sx = -1;
+					return 0;
+				} else if (b == 32) {
+					// mouse drag
+					if (g.sx == -1) {
+						g.sx = g.cx;
+						g.sy = g.cy;
+					}
+					g.cy = (my - 1) + g.rowoff;
+					g.cx = (mx - 1) + g.coloff;
+					if (g.cy > g.nr) g.cy = g.nr;
+					struct r *cur = (g.cy < g.nr) ? &g.r[g.cy] : NULL;
+					int rowlen = cur ? cur->l : 0;
+					if (g.cx > rowlen) g.cx = rowlen;
+					return 0;
+				}
+			}
+			return 0;
+		}
+
+		// check for ctrl+; sequences (CSI u \x1b[59;5u or \x1b[27;5;59~)
+		if (!strcmp(seq, "[59;5u") || !strcmp(seq, "[27;5;59~") || !strcmp(seq, ";")) {
+			return K_CMD;
+		}
 
 		if (seq[0] == '[') {
+			// shift arrows \x1b[1;2A .. D
+			if (!strcmp(&seq[1], "1;2A")) return K_S_UP;
+			if (!strcmp(&seq[1], "1;2B")) return K_S_DOWN;
+			if (!strcmp(&seq[1], "1;2C")) return K_S_RIGHT;
+			if (!strcmp(&seq[1], "1;2D")) return K_S_LEFT;
+
 			if (seq[1] >= '0' && seq[1] <= '9') {
-				if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
-				if (seq[2] == '~') {
+				if (seq[idx - 1] == '~') {
 					switch (seq[1]) {
 					case '1': return K_HOME;
 					case '3': return K_DEL;
@@ -301,6 +666,7 @@ static void mv(int key) {
 
 	switch (key) {
 	case K_LEFT:
+	case K_S_LEFT:
 		if (g.cx > 0) {
 			g.cx--;
 		} else if (g.cy > 0) {
@@ -309,6 +675,7 @@ static void mv(int key) {
 		}
 		break;
 	case K_RIGHT:
+	case K_S_RIGHT:
 		if (cur && g.cx < cur->l) {
 			g.cx++;
 		} else if (cur && g.cx == cur->l && g.cy + 1 < g.nr) {
@@ -317,9 +684,11 @@ static void mv(int key) {
 		}
 		break;
 	case K_UP:
+	case K_S_UP:
 		if (g.cy > 0) g.cy--;
 		break;
 	case K_DOWN:
+	case K_S_DOWN:
 		if (g.cy < g.nr) g.cy++;
 		break;
 	case K_HOME:
@@ -348,10 +717,53 @@ static void mv(int key) {
 	if (g.cx > rowlen) g.cx = rowlen;
 }
 
+static void cmd_menu(void) {
+	char buf[80] = {0};
+	int len = 0;
+
+	while (1) {
+		msg("cmd: 1) base16 2) helix 3) amber | :%s", buf);
+		rfsh();
+
+		int c = r_key();
+		if (c == '\x1b' || c == ('q' & 0x1f)) {
+			msg("");
+			break;
+		} else if (c == '1') {
+			load_th("base16_transparent");
+			break;
+		} else if (c == '2') {
+			load_th("helix_default");
+			break;
+		} else if (c == '3') {
+			load_th("unix_amber");
+			break;
+		} else if (c == '\r') {
+			if (!strcmp(buf, "w") || !strcmp(buf, "save")) {
+				sav();
+			} else if (!strncmp(buf, "theme ", 6)) {
+				load_th(buf + 6);
+			} else {
+				msg("unknown cmd: %s", buf);
+			}
+			break;
+		} else if (c == K_BACKSPACE || c == 8 || c == 127) {
+			if (len > 0) buf[--len] = '\0';
+		} else if (isprint(c) && len < (int)sizeof(buf) - 1) {
+			buf[len++] = c;
+			buf[len] = '\0';
+		}
+	}
+}
+
 int main(int argc, char **argv) {
 	if (!isatty(STDIN_FILENO)) {
 		err("stdin not a tty");
 	}
+
+	g.sx = -1;
+	g.sy = -1;
+	load_th("base16_transparent");
 
 	raw();
 	wsz();
@@ -360,13 +772,118 @@ int main(int argc, char **argv) {
 		opn(argv[1]);
 	}
 
-	msg("ctrl-q = quit");
+	msg("ctrl-s: save | ctrl-q: quit | ctrl-;: cmd menu");
 
 	while (1) {
 		rfsh();
 		int c = r_key();
-		if (c == 'q' || c == ('q' & 0x1f)) break;
-		mv(c);
+
+		// only ctrl-q quits
+		if (c == ('q' & 0x1f)) {
+			if (g.dirty && !g.quit_warn) {
+				msg("unsaved changes! press ctrl-q again to quit");
+				g.quit_warn = 1;
+				continue;
+			}
+			break;
+		}
+		g.quit_warn = 0;
+
+		switch (c) {
+		case 0:
+			// mouse event handled in r_key
+			break;
+
+		// command menu: ctrl+; or ctrl+p
+		case K_CMD:
+		case ('p' & 0x1f):
+			cmd_menu();
+			break;
+
+		// save: ctrl+s
+		case ('s' & 0x1f):
+			sav();
+			break;
+
+		// copy: ctrl+c
+		case ('c' & 0x1f):
+			copy_sel();
+			break;
+
+		// paste: ctrl+v
+		case ('v' & 0x1f):
+			paste();
+			break;
+
+		// cut: ctrl+x
+		case ('x' & 0x1f):
+			copy_sel();
+			del_sel();
+			break;
+
+		// select all: ctrl+a
+		case ('a' & 0x1f):
+			g.sx = 0;
+			g.sy = 0;
+			if (g.nr > 0) {
+				g.cy = g.nr - 1;
+				g.cx = g.r[g.cy].l;
+			}
+			break;
+
+		// shift + arrows
+		case K_S_UP:
+		case K_S_DOWN:
+		case K_S_LEFT:
+		case K_S_RIGHT:
+			if (g.sx == -1) {
+				g.sx = g.cx;
+				g.sy = g.cy;
+			}
+			mv(c);
+			break;
+
+		// normal movement clears selection
+		case K_UP:
+		case K_DOWN:
+		case K_LEFT:
+		case K_RIGHT:
+		case K_HOME:
+		case K_END:
+		case K_PGUP:
+		case K_PGDN:
+			g.sx = -1;
+			mv(c);
+			break;
+
+		case '\r':
+			ins_nl();
+			break;
+
+		case K_BACKSPACE:
+		case 8:
+			del_c();
+			break;
+
+		case K_DEL:
+			if (g.sx != -1) {
+				del_sel();
+			} else {
+				mv(K_RIGHT);
+				del_c();
+			}
+			break;
+
+		case '\x1b':
+			g.sx = -1; // esc clears selection
+			break;
+
+		default:
+			if (isprint(c) || c == '\t') {
+				ins_c(c);
+			}
+			break;
+		}
 	}
 
 	return 0;
