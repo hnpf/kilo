@@ -912,18 +912,21 @@ static int r_key(void) {
 
 		if (idx == 0) return '\x1b';
 
-		// alt+g: \x1bg
-		if (idx == 1 && seq[0] == 'g') return K_HELP;
+		// alt+g: \x1bg or \x1bG
+		if (idx == 1 && (seq[0] == 'g' || seq[0] == 'G')) return K_HELP;
 
 		// CSI u keyboard reporting (\x1b[<codepoint>;<mod>u)
 		if (seq[0] == '[') {
 			int key = 0, mod = 0;
 			if (sscanf(seq, "[%d;%du", &key, &mod) == 2) {
+				if (mod == 3 || mod == 7) { // Alt or Ctrl+Alt
+					if (key == 'g' || key == 'G') return K_HELP;
+				}
 				if (mod == 5 || mod == 7) { // Ctrl or Ctrl+Alt
 					if (key >= 'a' && key <= 'z') return key - 'a' + 1;
 					if (key >= 'A' && key <= 'Z') return key - 'A' + 1;
 					if (key == ';') return K_CMD;
-					if (key == 'g') return K_HELP;
+					if (key == 'g' || key == 'G') return K_HELP;
 				}
 				if (mod == 6) { // Ctrl+Shift
 					if (key == 'z' || key == 'Z') return K_REDO;
@@ -932,6 +935,8 @@ static int r_key(void) {
 				if (key == ';') return K_CMD;
 			}
 		}
+
+		if (strstr(seq, "103;3") || strstr(seq, "71;3") || strstr(seq, "27;3;103~")) return K_HELP;
 
 		// mouse report \x1b[<b;x;yM
 		if (seq[0] == '[' && seq[1] == '<') {
@@ -1097,42 +1102,104 @@ static void mv(int key) {
 	if (g.cx > rowlen) g.cx = rowlen;
 }
 
+static int u8_width(const char *s) {
+	int w = 0;
+	while (*s) {
+		unsigned char c = (unsigned char)*s;
+		if (c < 0x80) {
+			w++;
+			s++;
+		} else if ((c & 0xe0) == 0xc0) {
+			w++;
+			s += 2;
+		} else if ((c & 0xf0) == 0xe0) {
+			w++;
+			s += 3;
+		} else if ((c & 0xf8) == 0xf0) {
+			w += 2;
+			s += 4;
+		} else {
+			s++;
+		}
+	}
+	return w;
+}
+
 static void show_help(void) {
 	while (1) {
 		struct b b = {0};
 		b_add(&b, "\x1b[?25l\x1b[H", 9);
 
 		const char *lines[] = {
-			"┌─── kilo help (esc to close) ──────────────────────┐",
-			"│                                                   │",
-			"│  navigation                  editing              │",
-			"│  arrows / home / end         ctrl+s  save         │",
-			"│  pgup / pgdn                 ctrl+z  undo         │",
-			"│                              ctrl+y  redo         │",
-			"│  selection                   ctrl+c  copy line/sel│",
-			"│  shift+arrows / mouse drag   ctrl+x  cut line/sel │",
-			"│  ctrl+a       select all     ctrl+v  paste        │",
-			"│                                                   │",
-			"│  menus & help                                     │",
-			"│  ctrl+;       cmd / themes   ctrl+g  help overlay │",
-			"│  alt+g        keybindings    ctrl+q  quit editor  │",
-			"└───────────────────────────────────────────────────┘"
+			"┌─── kilo help (esc to close) ────────────────────────┐",
+			"│                                                     │",
+			"│   navigation                   editing              │",
+			"│   arrows / home / end          ctrl+s   save        │",
+			"│   pgup / pgdn                  ctrl+z   undo        │",
+			"│                                ctrl+y   redo        │",
+			"│   selection                    ctrl+c   copy        │",
+			"│   shift+arrows / mouse drag    ctrl+x   cut         │",
+			"│   ctrl+a    select all         ctrl+v   paste       │",
+			"│                                                     │",
+			"│   menus & help                                      │",
+			"│   ctrl+;    cmd / themes       ctrl+g   help        │",
+			"│   alt+g     keybindings        ctrl+q   quit        │",
+			"│                                                     │",
+			"└─────────────────────────────────────────────────────┘"
 		};
 		int nlines = sizeof(lines) / sizeof(lines[0]);
 		int start_y = (g.h > nlines) ? (g.h - nlines) / 2 : 0;
 
+		int r, gr, bl;
+		char border_color[32] = {0};
+		if (hex_rgb(g.th.cur_ln, &r, &gr, &bl)) {
+			snprintf(border_color, sizeof(border_color), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
+		} else {
+			strcpy(border_color, "\x1b[1;33m");
+		}
+
 		for (int y = 0; y < g.h + 2; y++) {
-			b_add(&b, "\x1b[K", 3);
+			th_bg(&b);
+			int col_written = 0;
+
 			if (y >= start_y && y < start_y + nlines) {
 				int lidx = y - start_y;
-				int len = strlen(lines[lidx]);
-				int pad = (g.w > len) ? (g.w - len) / 2 : 0;
-				for (int p = 0; p < pad; p++) b_add(&b, " ", 1);
-				b_add(&b, "\x1b[1;36m", 7);
-				b_add(&b, lines[lidx], len);
-				b_add(&b, "\x1b[m", 3);
+				int vlen = u8_width(lines[lidx]);
+				int pad = (g.w > vlen) ? (g.w - vlen) / 2 : 0;
+				for (int p = 0; p < pad; p++) {
+					b_add(&b, " ", 1);
+					col_written++;
+				}
+
+				if (lidx == 0 || lidx == nlines - 1) {
+					b_add(&b, border_color, strlen(border_color));
+					b_add(&b, lines[lidx], strlen(lines[lidx]));
+					th_fg(&b);
+				} else {
+					// opening border
+					b_add(&b, border_color, strlen(border_color));
+					b_add(&b, "│", 3);
+					th_fg(&b);
+
+					// inside text
+					int rawlen = strlen(lines[lidx]);
+					if (rawlen > 6) {
+						b_add(&b, &lines[lidx][3], rawlen - 6);
+					}
+
+					// closing border
+					b_add(&b, border_color, strlen(border_color));
+					b_add(&b, "│", 3);
+					th_fg(&b);
+				}
+				col_written += vlen;
 			}
-			if (y < g.h + 1) b_add(&b, "\r\n", 2);
+
+			while (col_written < g.w) {
+				b_add(&b, " ", 1);
+				col_written++;
+			}
+			b_add(&b, "\x1b[K\r\n", 5);
 		}
 
 		write(STDOUT_FILENO, b.p, b.l);
