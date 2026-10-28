@@ -73,6 +73,7 @@ struct s {
 	int cy;
 	int sx; // selection anchor x (-1 = no selection)
 	int sy; // selection anchor y
+	int pref_cx; // preferred column for vertical movement (-1 = use cx)
 	int rowoff;
 	int coloff;
 	int w;
@@ -219,6 +220,7 @@ static void snap_restore(struct snap *s) {
 	g.cy = s->cy;
 	g.sx = -1;
 	g.sy = -1;
+	g.pref_cx = -1;
 	g.r = malloc(sizeof(struct r) * (s->nr > 0 ? s->nr : 1));
 	for (int i = 0; i < s->nr; i++) {
 		g.r[i].l = s->r[i].l;
@@ -1048,6 +1050,10 @@ static int r_key(void) {
 
 static void mv(int key) {
 	struct r *cur = (g.cy < g.nr) ? &g.r[g.cy] : NULL;
+	int is_vert = (key == K_UP || key == K_DOWN || key == K_S_UP || key == K_S_DOWN);
+
+	// horizontal moves reset preferred column
+	if (!is_vert) g.pref_cx = -1;
 
 	switch (key) {
 	case K_LEFT:
@@ -1070,10 +1076,14 @@ static void mv(int key) {
 		break;
 	case K_UP:
 	case K_S_UP:
+		// save preferred column on first vertical move
+		if (g.pref_cx < 0) g.pref_cx = g.cx;
 		if (g.cy > 0) g.cy--;
 		break;
 	case K_DOWN:
 	case K_S_DOWN:
+		// save preferred column on first vertical move
+		if (g.pref_cx < 0) g.pref_cx = g.cx;
 		if (g.cy < g.nr) g.cy++;
 		break;
 	case K_HOME:
@@ -1099,7 +1109,13 @@ static void mv(int key) {
 
 	cur = (g.cy < g.nr) ? &g.r[g.cy] : NULL;
 	int rowlen = cur ? cur->l : 0;
-	if (g.cx > rowlen) g.cx = rowlen;
+	if (is_vert) {
+		// restore preferred column, clamped to new row length
+		int target = (g.pref_cx >= 0) ? g.pref_cx : g.cx;
+		g.cx = (target > rowlen) ? rowlen : target;
+	} else {
+		if (g.cx > rowlen) g.cx = rowlen;
+	}
 }
 
 static int u8_width(const char *s) {
@@ -1369,6 +1385,7 @@ int main(int argc, char **argv) {
 
 	g.sx = -1;
 	g.sy = -1;
+	g.pref_cx = -1;
 	load_th("base16_transparent");
 	load_cfg(); // restore saved theme if configured
 
