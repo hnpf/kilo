@@ -1127,8 +1127,11 @@ static int u8_width(const char *s) {
 
 static void show_help(void) {
 	while (1) {
+		wsz();
+		rfsh();
+
 		struct b b = {0};
-		b_add(&b, "\x1b[?25l\x1b[H", 9);
+		b_add(&b, "\x1b[?25l", 6);
 
 		const char *lines[] = {
 			"┌─── kilo help (esc to close) ────────────────────────┐",
@@ -1148,7 +1151,8 @@ static void show_help(void) {
 			"└─────────────────────────────────────────────────────┘"
 		};
 		int nlines = sizeof(lines) / sizeof(lines[0]);
-		int start_y = (g.h > nlines) ? (g.h - nlines) / 2 : 0;
+		int total_h = g.h + 2;
+		int start_y = (total_h > nlines) ? (total_h - nlines) / 2 + 1 : 1;
 
 		int r, gr, bl;
 		char border_color[32] = {0};
@@ -1158,48 +1162,37 @@ static void show_help(void) {
 			strcpy(border_color, "\x1b[1;33m");
 		}
 
-		for (int y = 0; y < g.h + 2; y++) {
+		for (int i = 0; i < nlines; i++) {
+			int y = start_y + i;
+			if (y > total_h) break;
+
+			int vlen = u8_width(lines[i]);
+			int start_x = (g.w > vlen) ? (g.w - vlen) / 2 + 1 : 1;
+
+			char pos[32];
+			int plen = snprintf(pos, sizeof(pos), "\x1b[%d;%dH", y, start_x);
+			b_add(&b, pos, plen);
+
 			th_bg(&b);
-			int col_written = 0;
 
-			if (y >= start_y && y < start_y + nlines) {
-				int lidx = y - start_y;
-				int vlen = u8_width(lines[lidx]);
-				int pad = (g.w > vlen) ? (g.w - vlen) / 2 : 0;
-				for (int p = 0; p < pad; p++) {
-					b_add(&b, " ", 1);
-					col_written++;
+			if (i == 0 || i == nlines - 1) {
+				b_add(&b, border_color, strlen(border_color));
+				b_add(&b, lines[i], strlen(lines[i]));
+				th_fg(&b);
+			} else {
+				b_add(&b, border_color, strlen(border_color));
+				b_add(&b, "│", 3);
+				th_fg(&b);
+
+				int rawlen = strlen(lines[i]);
+				if (rawlen > 6) {
+					b_add(&b, &lines[i][3], rawlen - 6);
 				}
 
-				if (lidx == 0 || lidx == nlines - 1) {
-					b_add(&b, border_color, strlen(border_color));
-					b_add(&b, lines[lidx], strlen(lines[lidx]));
-					th_fg(&b);
-				} else {
-					// opening border
-					b_add(&b, border_color, strlen(border_color));
-					b_add(&b, "│", 3);
-					th_fg(&b);
-
-					// inside text
-					int rawlen = strlen(lines[lidx]);
-					if (rawlen > 6) {
-						b_add(&b, &lines[lidx][3], rawlen - 6);
-					}
-
-					// closing border
-					b_add(&b, border_color, strlen(border_color));
-					b_add(&b, "│", 3);
-					th_fg(&b);
-				}
-				col_written += vlen;
+				b_add(&b, border_color, strlen(border_color));
+				b_add(&b, "│", 3);
+				th_fg(&b);
 			}
-
-			while (col_written < g.w) {
-				b_add(&b, " ", 1);
-				col_written++;
-			}
-			b_add(&b, "\x1b[K\r\n", 5);
 		}
 
 		write(STDOUT_FILENO, b.p, b.l);
