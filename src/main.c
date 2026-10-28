@@ -1178,7 +1178,7 @@ static char *prmpt(const char *prompt_str) {
 	}
 }
 
-static void cmd_menu(void) {
+static void theme_menu(void) {
 	scan_themes();
 	char orig_th[32];
 	strncpy(orig_th, g.th.name, sizeof(orig_th) - 1);
@@ -1198,36 +1198,30 @@ static void cmd_menu(void) {
 		}
 		if (sel_idx >= nmatches) sel_idx = (nmatches > 0) ? nmatches - 1 : 0;
 
-		// live preview current match if searching themes
-		if (nmatches > 0 && buf[0] != ':') {
+		// live preview current match
+		if (nmatches > 0) {
 			load_th(matches[sel_idx]);
 		}
 
-		char prompt[128];
-		if (buf[0] == ':') {
-			snprintf(prompt, sizeof(prompt), "cmd%s (enter: run, esc: cancel)", buf);
-		} else {
-			char mstr[80] = {0};
-			int mlen = 0;
-			for (int i = 0; i < nmatches && i < 3; i++) {
-				char item[40];
-				snprintf(item, sizeof(item), "%s%s%s ",
-					(i == sel_idx) ? "[" : "",
-					matches[i],
-					(i == sel_idx) ? "]" : "");
-				int ilen = strlen(item);
-				if (mlen + ilen < (int)sizeof(mstr) - 1) {
-					strcat(mstr, item);
-					mlen += ilen;
-				}
+		char mstr[80] = {0};
+		int mlen = 0;
+		for (int i = 0; i < nmatches && i < 3; i++) {
+			char item[40];
+			snprintf(item, sizeof(item), "%s%s%s ",
+				(i == sel_idx) ? "[" : "",
+				matches[i],
+				(i == sel_idx) ? "]" : "");
+			int ilen = strlen(item);
+			if (mlen + ilen < (int)sizeof(mstr) - 1) {
+				strcat(mstr, item);
+				mlen += ilen;
 			}
-			snprintf(prompt, sizeof(prompt), "theme: %s%s | %s(tab: next, enter: apply)",
-				buf,
-				nmatches == 0 ? "(no match) " : "",
-				mstr);
 		}
 
-		msg("%s", prompt);
+		msg("theme: %s%s | %s(tab: next, enter: apply, esc: cancel)",
+			buf,
+			nmatches == 0 ? "(no match) " : "",
+			mstr);
 		rfsh();
 
 		int c = r_key();
@@ -1237,15 +1231,7 @@ static void cmd_menu(void) {
 			msg("");
 			break;
 		} else if (c == '\r') {
-			if (buf[0] == ':') {
-				if (!strcmp(buf, ":w") || !strcmp(buf, ":save")) {
-					sav();
-				} else if (!strcmp(buf, ":q") || !strcmp(buf, ":quit")) {
-					exit(0);
-				} else {
-					msg("unknown cmd: %s", buf);
-				}
-			} else if (nmatches > 0) {
+			if (nmatches > 0) {
 				load_th(matches[sel_idx]);
 				save_cfg();
 				msg("theme applied: %s", matches[sel_idx]);
@@ -1255,7 +1241,7 @@ static void cmd_menu(void) {
 			if (nmatches > 0) sel_idx = (sel_idx + 1) % nmatches;
 		} else if (c == K_LEFT || c == K_UP) {
 			if (nmatches > 0) sel_idx = (sel_idx - 1 + nmatches) % nmatches;
-		} else if (c == K_BACKSPACE || c == 8 || c == 127) {
+		} else if (c == K_DEL || c == K_BACKSPACE || c == 8 || c == 127) {
 			if (len > 0) {
 				buf[--len] = '\0';
 				sel_idx = 0;
@@ -1264,6 +1250,54 @@ static void cmd_menu(void) {
 			buf[len++] = c;
 			buf[len] = '\0';
 			sel_idx = 0;
+		}
+	}
+}
+
+static void cmd_menu(void) {
+	char buf[64] = {0};
+	int len = 0;
+
+	while (1) {
+		msg("cmd: [1] theme  [2] save  [3] help  [4] quit | :%s", buf);
+		rfsh();
+
+		int c = r_key();
+		if (c == '\x1b' || c == ('q' & 0x1f)) {
+			msg("");
+			break;
+		} else if (len == 0 && (c == '1' || c == 't')) {
+			theme_menu();
+			break;
+		} else if (len == 0 && (c == '2' || c == 's')) {
+			sav();
+			break;
+		} else if (len == 0 && (c == '3' || c == 'h')) {
+			show_help();
+			break;
+		} else if (len == 0 && (c == '4' || c == 'q')) {
+			exit(0);
+		} else if (c == '\r') {
+			if (!strcmp(buf, "theme") || !strcmp(buf, "t")) {
+				theme_menu();
+			} else if (!strncmp(buf, "theme ", 6)) {
+				load_th(buf + 6);
+				save_cfg();
+			} else if (!strcmp(buf, "w") || !strcmp(buf, "save")) {
+				sav();
+			} else if (!strcmp(buf, "h") || !strcmp(buf, "help")) {
+				show_help();
+			} else if (!strcmp(buf, "q") || !strcmp(buf, "quit")) {
+				exit(0);
+			} else if (len > 0) {
+				msg("unknown cmd: %s", buf);
+			}
+			break;
+		} else if (c == K_DEL || c == K_BACKSPACE || c == 8 || c == 127) {
+			if (len > 0) buf[--len] = '\0';
+		} else if (isprint(c) && len < (int)sizeof(buf) - 1) {
+			buf[len++] = c;
+			buf[len] = '\0';
 		}
 	}
 }
