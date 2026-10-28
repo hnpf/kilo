@@ -124,6 +124,28 @@ static int hex_rgb(const char *hex, int *r, int *g, int *b) {
 	return 0;
 }
 
+static void th_bg(struct b *b) {
+	int r, gr, bl;
+	if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) {
+		b_add(b, "\x1b[49m", 5);
+	} else if (hex_rgb(g.th.bg, &r, &gr, &bl)) {
+		char cbuf[32];
+		int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
+		b_add(b, cbuf, clen);
+	}
+}
+
+static void th_fg(struct b *b) {
+	int r, gr, bl;
+	if (hex_rgb(g.th.fg, &r, &gr, &bl)) {
+		char cbuf[32];
+		int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
+		b_add(b, cbuf, clen);
+	} else {
+		b_add(b, "\x1b[39m", 5);
+	}
+}
+
 static void rst(void) {
 	// reset colors, disable mouse, pop kitty keyboard, reset modifyOtherKeys, exit alt screen, show cursor, restore term
 	const char s[] = "\x1b[0m\x1b[49m\x1b[39m\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[>4;0m\x1b[?1049l\x1b[?25h";
@@ -530,9 +552,18 @@ static void paste(void) {
 }
 
 static void load_th(const char *name) {
-	char path[128];
-	snprintf(path, sizeof(path), "themes/%s.conf", name);
-	FILE *fp = fopen(path, "r");
+	char path[256];
+	const char *home = getenv("HOME");
+	FILE *fp = NULL;
+
+	if (home) {
+		snprintf(path, sizeof(path), "%s/.config/kilo/themes/%s.conf", home, name);
+		fp = fopen(path, "r");
+	}
+	if (!fp) {
+		snprintf(path, sizeof(path), "themes/%s.conf", name);
+		fp = fopen(path, "r");
+	}
 	if (!fp) {
 		snprintf(path, sizeof(path), "/etc/kilo/themes/%s.conf", name);
 		fp = fopen(path, "r");
@@ -559,6 +590,50 @@ static void load_th(const char *name) {
 	msg("theme: %s", name);
 }
 
+static char *cfg_path(void) {
+	const char *home = getenv("HOME");
+	if (!home) return NULL;
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/.config/kilo/kilo.conf", home);
+	return path;
+}
+
+static void load_cfg(void) {
+	char *p = cfg_path();
+	if (!p) return;
+	FILE *fp = fopen(p, "r");
+	if (!fp) return;
+
+	char line[128];
+	while (fgets(line, sizeof(line), fp)) {
+		char key[32], val[32];
+		if (sscanf(line, " %31[^= ] = \"%31[^\"]\"", key, val) == 2 ||
+		    sscanf(line, " %31[^= ] = %31s", key, val) == 2) {
+			if (!strcmp(key, "theme")) {
+				load_th(val);
+			}
+		}
+	}
+	fclose(fp);
+}
+
+static void save_cfg(void) {
+	const char *home = getenv("HOME");
+	if (!home) return;
+	char dir[256];
+	snprintf(dir, sizeof(dir), "%s/.config", home);
+	mkdir(dir, 0755);
+	snprintf(dir, sizeof(dir), "%s/.config/kilo", home);
+	mkdir(dir, 0755);
+
+	char *p = cfg_path();
+	if (!p) return;
+	FILE *fp = fopen(p, "w");
+	if (!fp) return;
+	fprintf(fp, "[editor]\ntheme = \"%s\"\n", g.th.name[0] ? g.th.name : "base16_transparent");
+	fclose(fp);
+}
+
 static void scrl(void) {
 	if (g.cy < g.rowoff) {
 		g.rowoff = g.cy;
@@ -580,28 +655,14 @@ static void rfsh(void) {
 	struct b b = {0};
 
 	// hide cursor during draw
-	b_add(&b, "\x1b[?25l", 6);
-	b_add(&b, "\x1b[H", 3);
+	b_add(&b, "\x1b[?25l\x1b[H", 9);
 
 	// apply theme bg & fg
-	int r, gr, bl;
-	if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) {
-		b_add(&b, "\x1b[49m", 5);
-	} else if (hex_rgb(g.th.bg, &r, &gr, &bl)) {
-		char cbuf[32];
-		int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
-		b_add(&b, cbuf, clen);
-	}
-
-	if (hex_rgb(g.th.fg, &r, &gr, &bl)) {
-		char cbuf[32];
-		int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
-		b_add(&b, cbuf, clen);
-	} else {
-		b_add(&b, "\x1b[39m", 5);
-	}
+	th_bg(&b);
+	th_fg(&b);
 
 	// selection ANSI
+	int r, gr, bl;
 	char sel_on[32];
 	if (hex_rgb(g.th.sel, &r, &gr, &bl)) {
 		snprintf(sel_on, sizeof(sel_on), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
@@ -621,8 +682,10 @@ static void rfsh(void) {
 	// draw file lines
 	for (int y = 0; y < g.h; y++) {
 		int filerow = y + g.rowoff;
+		int col_written = 0;
 
 		// line number gutter
+		th_bg(&b);
 		if (filerow < g.nr) {
 			int cur = (filerow == g.cy);
 			if (cur && hex_rgb(g.th.cur_ln, &r, &gr, &bl)) {
@@ -640,20 +703,14 @@ static void rfsh(void) {
 			char numbuf[32];
 			int nlen = snprintf(numbuf, sizeof(numbuf), "%*d │ ", ln_w, filerow + 1);
 			b_add(&b, numbuf, nlen);
-
-			// restore theme fg
-			if (hex_rgb(g.th.fg, &r, &gr, &bl)) {
-				char cbuf[32];
-				int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
-				b_add(&b, cbuf, clen);
-			} else {
-				b_add(&b, "\x1b[39m", 5);
-			}
+			col_written += gutter;
+			th_fg(&b);
 		} else {
 			b_add(&b, "\x1b[90m", 5);
 			for (int p = 0; p < ln_w; p++) b_add(&b, " ", 1);
 			b_add(&b, " ~ ", 3);
-			b_add(&b, "\x1b[m", 3);
+			col_written += gutter;
+			th_fg(&b);
 		}
 
 		if (filerow >= g.nr) {
@@ -663,8 +720,12 @@ static void rfsh(void) {
 					"kilo editor -- version %s", KILO_VER);
 				if (welclen > text_w) welclen = text_w;
 				int pad = (text_w - welclen) / 2;
-				while (pad-- > 0) b_add(&b, " ", 1);
+				while (pad-- > 0) {
+					b_add(&b, " ", 1);
+					col_written++;
+				}
 				b_add(&b, welc, welclen);
+				col_written += welclen;
 			}
 		} else {
 			int len = g.r[filerow].l - g.coloff;
@@ -678,28 +739,25 @@ static void rfsh(void) {
 					b_add(&b, sel_on, strlen(sel_on));
 					in_highlight = 1;
 				} else if (!sel && in_highlight) {
-					// restore normal bg
-					if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) {
-						b_add(&b, "\x1b[49m", 5);
-					} else if (hex_rgb(g.th.bg, &r, &gr, &bl)) {
-						char cbuf[32];
-						int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[48;2;%d;%d;%dm", r, gr, bl);
-						b_add(&b, cbuf, clen);
-					} else {
-						b_add(&b, "\x1b[m", 3);
-					}
+					th_bg(&b);
 					in_highlight = 0;
 				}
 				b_add(&b, &g.r[filerow].s[col], 1);
+				col_written++;
 			}
 			if (in_highlight) {
-				if (!strcmp(g.th.bg, "none") || !g.th.bg[0]) b_add(&b, "\x1b[49m", 5);
-				else b_add(&b, "\x1b[m", 3);
+				th_bg(&b);
 			}
 		}
 
-		b_add(&b, "\x1b[K", 3);
-		b_add(&b, "\r\n", 2);
+		// pad remainder of row to full screen width under theme background
+		th_bg(&b);
+		while (col_written < g.w) {
+			b_add(&b, " ", 1);
+			col_written++;
+		}
+
+		b_add(&b, "\x1b[K\r\n", 5);
 	}
 
 	// status bar (inverted colors / file info)
@@ -723,15 +781,21 @@ static void rfsh(void) {
 		b_add(&b, " ", 1);
 		len++;
 	}
-	b_add(&b, "\x1b[m", 3);
-	b_add(&b, "\r\n", 2);
+	b_add(&b, "\x1b[m\r\n", 5);
 
-	// status message line
-	b_add(&b, "\x1b[K", 3);
+	// status message line (padded with theme bg)
+	th_bg(&b);
+	th_fg(&b);
 	int msglen = strlen(g.msg);
 	if (msglen > g.w) msglen = g.w;
+	int mcols = 0;
 	if (msglen && time(NULL) - g.msg_t < 5) {
 		b_add(&b, g.msg, msglen);
+		mcols = msglen;
+	}
+	while (mcols < g.w) {
+		b_add(&b, " ", 1);
+		mcols++;
 	}
 
 	// move cursor to cx, cy relative to viewport + gutter
@@ -1040,18 +1104,22 @@ static void cmd_menu(void) {
 			break;
 		} else if (c == '1') {
 			load_th("base16_transparent");
+			save_cfg();
 			break;
 		} else if (c == '2') {
 			load_th("helix_default");
+			save_cfg();
 			break;
 		} else if (c == '3') {
 			load_th("unix_amber");
+			save_cfg();
 			break;
 		} else if (c == '\r') {
 			if (!strcmp(buf, "w") || !strcmp(buf, "save")) {
 				sav();
 			} else if (!strncmp(buf, "theme ", 6)) {
 				load_th(buf + 6);
+				save_cfg();
 			} else if (!strcmp(buf, "q") || !strcmp(buf, "quit")) {
 				exit(0);
 			} else {
@@ -1075,6 +1143,7 @@ int main(int argc, char **argv) {
 	g.sx = -1;
 	g.sy = -1;
 	load_th("base16_transparent");
+	load_cfg(); // restore saved theme if configured
 
 	raw();
 	wsz();
