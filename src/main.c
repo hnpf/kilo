@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -94,6 +95,8 @@ struct s {
 };
 
 static struct s g;
+static char g_themes[64][32];
+static int g_nthemes = 0;
 
 static void err(const char *m) {
 	perror(m);
@@ -323,10 +326,12 @@ static void opn(const char *fn) {
 	g.dirty = 0;
 }
 
+static char *prmpt(const char *prompt_str);
+
 static void sav(void) {
 	if (!g.fn) {
-		msg("no filename");
-		return;
+		g.fn = prmpt("save as: %s (esc or ctrl-c to cancel)");
+		if (!g.fn) return;
 	}
 
 	int len = 0;
@@ -632,6 +637,56 @@ static void save_cfg(void) {
 	if (!fp) return;
 	fprintf(fp, "[editor]\ntheme = \"%s\"\n", g.th.name[0] ? g.th.name : "base16_transparent");
 	fclose(fp);
+}
+
+static void scan_themes(void) {
+	g_nthemes = 0;
+	char udir[256];
+	const char *home = getenv("HOME");
+	if (home) {
+		snprintf(udir, sizeof(udir), "%s/.config/kilo/themes", home);
+	}
+
+	for (int d = 0; d < 3; d++) {
+		const char *dirpath = (d == 0) ? "themes" : (d == 1 && home ? udir : "/etc/kilo/themes");
+		DIR *dp = opendir(dirpath);
+		if (!dp) continue;
+		struct dirent *de;
+		while ((de = readdir(dp)) != NULL && g_nthemes < 64) {
+			char *ext = strstr(de->d_name, ".conf");
+			if (ext && strlen(ext) == 5) {
+				char name[32];
+				size_t len = ext - de->d_name;
+				if (len < sizeof(name)) {
+					strncpy(name, de->d_name, len);
+					name[len] = '\0';
+					int exists = 0;
+					for (int i = 0; i < g_nthemes; i++) {
+						if (!strcmp(g_themes[i], name)) { exists = 1; break; }
+					}
+					if (!exists) {
+						snprintf(g_themes[g_nthemes++], sizeof(g_themes[0]), "%s", name);
+					}
+				}
+			}
+		}
+		closedir(dp);
+	}
+}
+
+static int str_contains_ci(const char *haystack, const char *needle) {
+	if (!needle || !needle[0]) return 1;
+	size_t nlen = strlen(needle);
+	size_t hlen = strlen(haystack);
+	if (nlen > hlen) return 0;
+	for (size_t i = 0; i <= hlen - nlen; i++) {
+		size_t j = 0;
+		while (j < nlen && tolower((unsigned char)haystack[i + j]) == tolower((unsigned char)needle[j])) {
+			j++;
+		}
+		if (j == nlen) return 1;
+	}
+	return 0;
 }
 
 static void scrl(void) {
@@ -1090,47 +1145,125 @@ static void show_help(void) {
 	}
 }
 
-static void cmd_menu(void) {
-	char buf[80] = {0};
-	int len = 0;
+static char *prmpt(const char *prompt_str) {
+	size_t bufsize = 128;
+	char *buf = malloc(bufsize);
+	size_t buflen = 0;
+	buf[0] = '\0';
 
 	while (1) {
-		msg("cmd: 1) base16 2) helix 3) amber | :%s", buf);
+		msg(prompt_str, buf);
+		rfsh();
+
+		int c = r_key();
+		if (c == K_DEL || c == K_BACKSPACE || c == 8 || c == 127) {
+			if (buflen != 0) buf[--buflen] = '\0';
+		} else if (c == '\x1b' || c == ('c' & 0x1f)) {
+			msg("save aborted");
+			free(buf);
+			return NULL;
+		} else if (c == '\r') {
+			if (buflen != 0) {
+				msg("");
+				return buf;
+			}
+		} else if (!iscntrl(c) && c < 128) {
+			if (buflen + 1 >= bufsize) {
+				bufsize *= 2;
+				buf = realloc(buf, bufsize);
+			}
+			buf[buflen++] = c;
+			buf[buflen] = '\0';
+		}
+	}
+}
+
+static void cmd_menu(void) {
+	scan_themes();
+	char orig_th[32];
+	strncpy(orig_th, g.th.name, sizeof(orig_th) - 1);
+	orig_th[sizeof(orig_th) - 1] = '\0';
+
+	char buf[64] = {0};
+	int len = 0;
+	int sel_idx = 0;
+
+	while (1) {
+		const char *matches[64];
+		int nmatches = 0;
+		for (int i = 0; i < g_nthemes; i++) {
+			if (str_contains_ci(g_themes[i], buf)) {
+				matches[nmatches++] = g_themes[i];
+			}
+		}
+		if (sel_idx >= nmatches) sel_idx = (nmatches > 0) ? nmatches - 1 : 0;
+
+		// live preview current match if searching themes
+		if (nmatches > 0 && buf[0] != ':') {
+			load_th(matches[sel_idx]);
+		}
+
+		char prompt[128];
+		if (buf[0] == ':') {
+			snprintf(prompt, sizeof(prompt), "cmd%s (enter: run, esc: cancel)", buf);
+		} else {
+			char mstr[80] = {0};
+			int mlen = 0;
+			for (int i = 0; i < nmatches && i < 3; i++) {
+				char item[40];
+				snprintf(item, sizeof(item), "%s%s%s ",
+					(i == sel_idx) ? "[" : "",
+					matches[i],
+					(i == sel_idx) ? "]" : "");
+				int ilen = strlen(item);
+				if (mlen + ilen < (int)sizeof(mstr) - 1) {
+					strcat(mstr, item);
+					mlen += ilen;
+				}
+			}
+			snprintf(prompt, sizeof(prompt), "theme: %s%s | %s(tab: next, enter: apply)",
+				buf,
+				nmatches == 0 ? "(no match) " : "",
+				mstr);
+		}
+
+		msg("%s", prompt);
 		rfsh();
 
 		int c = r_key();
 		if (c == '\x1b' || c == ('q' & 0x1f)) {
+			// cancel: restore original theme
+			load_th(orig_th);
 			msg("");
 			break;
-		} else if (c == '1') {
-			load_th("base16_transparent");
-			save_cfg();
-			break;
-		} else if (c == '2') {
-			load_th("helix_default");
-			save_cfg();
-			break;
-		} else if (c == '3') {
-			load_th("unix_amber");
-			save_cfg();
-			break;
 		} else if (c == '\r') {
-			if (!strcmp(buf, "w") || !strcmp(buf, "save")) {
-				sav();
-			} else if (!strncmp(buf, "theme ", 6)) {
-				load_th(buf + 6);
+			if (buf[0] == ':') {
+				if (!strcmp(buf, ":w") || !strcmp(buf, ":save")) {
+					sav();
+				} else if (!strcmp(buf, ":q") || !strcmp(buf, ":quit")) {
+					exit(0);
+				} else {
+					msg("unknown cmd: %s", buf);
+				}
+			} else if (nmatches > 0) {
+				load_th(matches[sel_idx]);
 				save_cfg();
-			} else if (!strcmp(buf, "q") || !strcmp(buf, "quit")) {
-				exit(0);
-			} else {
-				msg("unknown cmd: %s", buf);
+				msg("theme applied: %s", matches[sel_idx]);
 			}
 			break;
-		} else if (c == K_BACKSPACE || c == 8) {
-			if (len > 0) buf[--len] = '\0';
+		} else if (c == '\t' || c == K_RIGHT || c == K_DOWN) {
+			if (nmatches > 0) sel_idx = (sel_idx + 1) % nmatches;
+		} else if (c == K_LEFT || c == K_UP) {
+			if (nmatches > 0) sel_idx = (sel_idx - 1 + nmatches) % nmatches;
+		} else if (c == K_BACKSPACE || c == 8 || c == 127) {
+			if (len > 0) {
+				buf[--len] = '\0';
+				sel_idx = 0;
+			}
 		} else if (isprint(c) && len < (int)sizeof(buf) - 1) {
 			buf[len++] = c;
 			buf[len] = '\0';
+			sel_idx = 0;
 		}
 	}
 }
