@@ -1495,7 +1495,33 @@ int main(int argc, char **argv) {
 		case K_PGUP:
 		case K_PGDN:
 			g.in_type = 0;
+			if (g.sx != -1) {
+				int y1, x1, y2, x2;
+				sel_bounds(&y1, &x1, &y2, &x2);
+				g.sx = -1;
+				g.sy = -1;
+				if (c == K_LEFT) {
+					g.cy = y1;
+					g.cx = x1;
+					break;
+				} else if (c == K_RIGHT) {
+					g.cy = y2;
+					g.cx = x2;
+					break;
+				} else if (c == K_UP) {
+					g.cy = y1;
+					g.cx = x1;
+					mv(K_UP);
+					break;
+				} else if (c == K_DOWN) {
+					g.cy = y2;
+					g.cx = x2;
+					mv(K_DOWN);
+					break;
+				}
+			}
 			g.sx = -1;
+			g.sy = -1;
 			mv(c);
 			break;
 
