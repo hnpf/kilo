@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: install Lua development files
+        run: sudo apt-get update && sudo apt-get install -y liblua5.4-dev
+
       - name: build
         run: make
 
