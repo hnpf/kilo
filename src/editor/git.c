@@ -462,9 +462,9 @@ char git_line_marker(const struct git_state *state, int line) {
 }
 
 const char *git_branch_name(const struct git_state *state) {
-	return state ? state->branch : "";
+	return g.git_enabled && state ? state->branch : "";
 }
 
 int git_state_enabled(const struct git_state *state) {
-	return state && state->in_repo;
+	return g.git_enabled && state && state->in_repo;
 }

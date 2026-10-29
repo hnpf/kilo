@@ -29,6 +29,107 @@ static int u8_width(const char *s) {
 	return w;
 }
 
+static void menu_text_add(char *out, int *used, int width, const char *text, size_t length) {
+	if (*used >= width) return;
+	int room = width - *used;
+	if (length > (size_t)room) length = (size_t)room;
+	memcpy(out + *used, text, length);
+	*used += (int)length;
+	out[*used] = '\0';
+}
+
+static void command_menu_message(const char *query, int list_all,
+		const char **matches, int nmatch, int selected) {
+	char message[sizeof(g.msg)] = {0};
+	int width = g.w;
+	if (width > (int)sizeof(message) - 1) width = (int)sizeof(message) - 1;
+	if (width < 0) width = 0;
+	int used = 0;
+
+	if (nmatch > 0 && width > 0) {
+		int selected_len = (int)strlen(matches[selected]);
+		int selected_cost = selected_len + 2;
+		int reserve = selected_cost < width ? selected_cost : width;
+		int prefix_budget = width - reserve;
+		if (list_all && !query[0]) {
+			if (prefix_budget >= 4) menu_text_add(message, &used, width, "cmd ", 4);
+		} else if (query[0] && prefix_budget > 0) {
+			menu_text_add(message, &used, width, ":", 1);
+			int query_room = prefix_budget - 2;
+			if (query_room > 0) {
+				size_t query_len = strlen(query);
+				if (query_len > (size_t)query_room) query_len = (size_t)query_room;
+				menu_text_add(message, &used, width, query, query_len);
+			}
+			if (prefix_budget >= 2) menu_text_add(message, &used, width, " ", 1);
+		}
+
+		int available = width - used;
+		if (selected_cost > available) {
+			if (available >= 3) {
+				menu_text_add(message, &used, width, "[", 1);
+				menu_text_add(message, &used, width, matches[selected], (size_t)(available - 2));
+				menu_text_add(message, &used, width, "]", 1);
+			} else {
+				menu_text_add(message, &used, width, matches[selected], (size_t)available);
+			}
+			msg("%s", message);
+			return;
+		}
+
+		int marker_reserve = (selected > 0 ? 4 : 0) + (selected + 1 < nmatch ? 4 : 0);
+		if (available - marker_reserve < selected_cost) marker_reserve = 0;
+		int list_available = available - marker_reserve;
+		int first = selected, last = selected, list_used = selected_cost;
+		int left_open = 1, right_open = 1;
+		while (left_open || right_open) {
+			if (left_open) {
+				if (first == 0) left_open = 0;
+				else {
+					int cost = (int)strlen(matches[first - 1]) + 2;
+					if (list_used + cost <= list_available) { first--; list_used += cost; }
+					else left_open = 0;
+				}
+			}
+			if (right_open) {
+				if (last + 1 >= nmatch) right_open = 0;
+				else {
+					int cost = (int)strlen(matches[last + 1]) + 2;
+					if (list_used + cost <= list_available) { last++; list_used += cost; }
+					else right_open = 0;
+				}
+			}
+		}
+		int hidden_before = first > 0;
+		int hidden_after = last + 1 < nmatch;
+		int indicator_space = available - list_used;
+		if (hidden_before && hidden_after && indicator_space >= 8) {
+			menu_text_add(message, &used, width, "... ", 4);
+			indicator_space -= 4;
+		} else if (hidden_before && indicator_space >= 4) {
+			menu_text_add(message, &used, width, "... ", 4);
+			indicator_space -= 4;
+			hidden_before = 0;
+		}
+		for (int i = first; i <= last; i++) {
+			if (i > first) menu_text_add(message, &used, width, "  ", 2);
+			if (i == selected) menu_text_add(message, &used, width, "[", 1);
+			menu_text_add(message, &used, width, matches[i], strlen(matches[i]));
+			if (i == selected) menu_text_add(message, &used, width, "]", 1);
+		}
+		if (hidden_after && indicator_space >= 4)
+			menu_text_add(message, &used, width, " ...", 4);
+		else if (hidden_before && indicator_space >= 4)
+			menu_text_add(message, &used, width, "... ", 4);
+	} else if (query[0]) {
+		menu_text_add(message, &used, width, "no matches: ", 12);
+		menu_text_add(message, &used, width, query, strlen(query));
+	} else {
+		menu_text_add(message, &used, width, "type / for commands", 19);
+	}
+	msg("%s", message);
+}
+
 void show_help(void) {
 	while (1) {
 		wsz();
@@ -55,6 +156,7 @@ void show_help(void) {
 			"│   ctrl+;    cmd / themes       ctrl+g   help        │",
 			"│   ctrl+b    toggle file sidebar                    │",
 			"│   git gutter: + added ~ modified - deleted          │",
+			"│   git: toggle; gutter: bright/muted                 │",
 			"│   ctrl+t    new tab          ctrl+w close tab       │",
 			"│   alt+left/right   switch tabs  | click x to close  │",
 			"│   alt+g     keybindings        ctrl+q   quit        │",
@@ -197,11 +299,11 @@ void cmd_menu(void) {
 	int len = 0;
 	int selected = 0;
 	int list_all = 0;
-	static const char *commands[] = {"theme", "save", "help", "quit", "plugins off", "plugins on", "word wrap", "sidebar"};
+	static const char *commands[] = {"theme", "save", "help", "quit", "plugins off", "plugins on", "word wrap", "sidebar", "git", "git off", "git on", "gutter", "gutter bright", "gutter muted"};
 	const int ncommands = (int)(sizeof(commands) / sizeof(commands[0]));
 
 	while (1) {
-		const char *matches[8];
+		const char *matches[16];
 		int nmatch = 0;
 		if (len > 0 || list_all) {
 			for (int i = 0; i < ncommands; i++) {
@@ -210,19 +312,7 @@ void cmd_menu(void) {
 			}
 		}
 		if (selected >= nmatch) selected = nmatch ? nmatch - 1 : 0;
-		char suggestions[64] = {0};
-		int used = 0;
-		for (int i = 0; i < nmatch; i++) {
-			int n = snprintf(suggestions + used, sizeof(suggestions) - (size_t)used,
-				"%s%s%s", i ? "  " : "", i == selected ? "[" : "", matches[i]);
-			if (n < 0 || n >= (int)(sizeof(suggestions) - (size_t)used)) break;
-			used += n;
-			if (i == selected && used + 1 < (int)sizeof(suggestions)) suggestions[used++] = ']';
-			suggestions[used] = '\0';
-		}
-		if (nmatch) msg("%s: %s | :%s", list_all && len == 0 ? "Commands" : "Matches", suggestions, buf);
-		else if (len) msg("no matching commands | :%s", buf);
-		else msg("enter cmd, :%s  (type / for commands)", buf);
+		command_menu_message(buf, list_all, matches, nmatch, selected);
 		rfsh();
 
 		int c = r_key();
@@ -284,6 +374,15 @@ void cmd_menu(void) {
 			} else if (!strcmp(buf, "sidebar")) {
 				sidebar_handle_key('b' & 0x1f);
 				msg("file sidebar %s", sidebar_is_open() ? "shown" : "hidden");
+			} else if (!strcmp(buf, "git") || !strcmp(buf, "git on") || !strcmp(buf, "git off")) {
+				g.git_enabled = !strcmp(buf, "git") ? !g.git_enabled : !strcmp(buf, "git on");
+				if (!g.git_enabled) git_suspend_active();
+				save_cfg();
+				msg("Git integration %s", g.git_enabled ? "enabled" : "disabled");
+			} else if (!strcmp(buf, "gutter") || !strcmp(buf, "gutter bright") || !strcmp(buf, "gutter muted")) {
+				g.gutter_bright = !strcmp(buf, "gutter") ? !g.gutter_bright : !strcmp(buf, "gutter bright");
+				save_cfg();
+				msg("non-repo gutter colors %s", g.gutter_bright ? "bright" : "muted");
 			} else if (len > 0) {
 				msg("unknown cmd: %s", buf);
 			}

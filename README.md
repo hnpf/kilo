@@ -23,6 +23,8 @@ copy in a script, or change `plugin_dir` in `~/.config/kilo/kilo.conf`:
 plugins = true
 plugin_dir = "~/my-kilo-plugins"
 wrap = true
+git = true
+gutter_bright = false
 ```
 
 Word wrapping can also be toggled from the command menu (`ctrl+;` → `word wrap`);
@@ -45,6 +47,11 @@ When a file is inside a Git repository, the gutter compares the current buffer
 with `HEAD`: green `+` marks added lines, yellow `~` modified lines, and red `-`
 marks deletions at the next line (or the empty row after the file). The current
 branch appears in the status bar.
+
+Use `ctrl+;` → `git` to toggle Git branch/diff integration, or choose `git on` /
+`git off`. For files without Git markers, `gutter` toggles brighter line numbers
+and end-of-file markers; `gutter bright` and `gutter muted` set it explicitly.
+Both settings are saved in `kilo.conf`.
 
 On exit, Kilo saves file-backed tabs, their cursor and viewport positions, and
 the sidebar's open/focus state to `~/.config/kilo/session`. The next launch

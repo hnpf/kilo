@@ -90,6 +90,11 @@ void load_cfg(void) {
 				g.plugins_enabled = strcmp(val, "false") && strcmp(val, "0") && strcmp(val, "no");
 			} else if (!strcmp(key, "wrap")) {
 				g.word_wrap = !strcmp(val, "true") || !strcmp(val, "1") || !strcmp(val, "yes");
+			} else if (!strcmp(key, "git")) {
+				g.git_enabled = !strcmp(val, "true") || !strcmp(val, "1") || !strcmp(val, "yes");
+			} else if (!strcmp(key, "gutter_bright")) {
+				g.gutter_bright = !strcmp(val, "false") || !strcmp(val, "0") || !strcmp(val, "no") ? 0 :
+					(!strcmp(val, "true") || !strcmp(val, "1") || !strcmp(val, "yes"));
 			} else if (!strcmp(key, "plugin_dir")) {
 				snprintf(g.plugin_dir, sizeof(g.plugin_dir), "%s", val);
 			}
@@ -111,11 +116,13 @@ void save_cfg(void) {
 	if (!p) return;
 	FILE *fp = fopen(p, "w");
 	if (!fp) return;
-	fprintf(fp, "[editor]\ntheme = \"%s\"\noverwrite = %s\nplugins = %s\nwrap = %s\n",
+	fprintf(fp, "[editor]\ntheme = \"%s\"\noverwrite = %s\nplugins = %s\nwrap = %s\ngit = %s\ngutter_bright = %s\n",
 		g.th.name[0] ? g.th.name : "base16_transparent",
 		g.overwrite ? "true" : "false",
 		g.plugins_enabled ? "true" : "false",
-		g.word_wrap ? "true" : "false");
+		g.word_wrap ? "true" : "false",
+		g.git_enabled ? "true" : "false",
+		g.gutter_bright ? "true" : "false");
 	if (g.plugin_dir[0]) fprintf(fp, "plugin_dir = \"%s\"\n", g.plugin_dir);
 	fclose(fp);
 }

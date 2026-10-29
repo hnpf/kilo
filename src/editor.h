@@ -66,7 +66,7 @@ struct s {
 	int search_on;
 	char msg[80];
 	time_t msg_t;
-	int dirty, overwrite, word_wrap, plugins_enabled;
+	int dirty, overwrite, word_wrap, plugins_enabled, git_enabled, gutter_bright;
 	char plugin_dir[512];
 	int quit_warn, in_type;
 	size_t file_sz;
@@ -87,6 +87,7 @@ struct git_state;
 struct git_state *git_state_create(void);
 void git_state_destroy(struct git_state *state);
 void git_state_suspend(struct git_state *state);
+void git_suspend_active(void);
 void git_state_refresh(struct git_state *state, unsigned long buffer_gen);
 char git_line_marker(const struct git_state *state, int line);
 const char *git_branch_name(const struct git_state *state);

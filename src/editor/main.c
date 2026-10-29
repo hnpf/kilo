@@ -44,6 +44,10 @@ static size_t history_total_bytes;
 static uint64_t history_serial;
 static struct git_state *active_git_state;
 
+void git_suspend_active(void) {
+	git_state_suspend(active_git_state);
+}
+
 void err(const char *m) {
 	perror(m);
 	exit(1);
@@ -1255,7 +1259,7 @@ static void scrl(void) {
 }
 
 void rfsh(void) {
-	git_state_refresh(active_git_state, g.buffer_gen);
+	if (g.git_enabled) git_state_refresh(active_git_state, g.buffer_gen);
 	scrl();
 	syntax_prepare();
 
@@ -1284,6 +1288,7 @@ void rfsh(void) {
 	int side = sidebar_width();
 	int gutter = margin - side;
 	int git_gutter = git_state_enabled(active_git_state);
+	int bright_gutter = g.gutter_bright && !git_gutter;
 	int ln_w = gutter - (git_gutter ? 5 : 3);
 	int text_w = g.w - margin;
 	if (text_w < 1) text_w = 1;
@@ -1314,12 +1319,12 @@ void rfsh(void) {
 				char cbuf[32];
 				int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
 				b_add(&b, cbuf, clen);
-			} else if (!cur && hex_rgb(g.th.ln, &r, &gr, &bl)) {
+			} else if (!cur && hex_rgb(bright_gutter ? g.th.fg : g.th.ln, &r, &gr, &bl)) {
 				char cbuf[32];
 				int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[38;2;%d;%d;%dm", r, gr, bl);
 				b_add(&b, cbuf, clen);
 			} else {
-				b_add(&b, cur ? "\x1b[1;33m" : "\x1b[90m", cur ? 7 : 5);
+				b_add(&b, cur ? "\x1b[1;33m" : (bright_gutter ? "\x1b[37m" : "\x1b[90m"), cur ? 7 : 5);
 			}
 
 			char numbuf[32];
@@ -1339,7 +1344,8 @@ void rfsh(void) {
 			}
 			col_written += gutter;
 		} else {
-			b_add(&b, "\x1b[90m", 5);
+			if (bright_gutter) th_fg(&b);
+			else b_add(&b, "\x1b[90m", 5);
 			for (int p = 0; p < ln_w; p++) b_add(&b, " ", 1);
 			if (git_gutter) {
 				b_add(&b, " ", 1);
@@ -2218,6 +2224,7 @@ int main(int argc, char **argv) {
 	g.sy = -1;
 	g.pref_cx = -1;
 	g.plugins_enabled = 1;
+	g.git_enabled = 1;
 	load_th("base16_transparent");
 	load_cfg(); // restore saved theme if configured
 
