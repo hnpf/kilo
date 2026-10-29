@@ -30,6 +30,11 @@ gutter_bright = false
 Word wrapping can also be toggled from the command menu (`ctrl+;` → `word wrap`);
 the setting is saved in `kilo.conf`.
 
+The command menu shows matching commands as you type. Type `/` to list every
+command, use the arrow keys to cycle through suggestions, and press Enter to run
+the selection or Tab to complete it. The suggestion list scrolls to keep the
+current selection visible when it does not fit on screen.
+
 The file sidebar opens automatically when Kilo starts without a file. Use the
 arrow keys to navigate, right/enter to expand a folder, left to collapse it, and
 enter or double-click a file to open it. Type in the focused sidebar to search
@@ -58,9 +63,8 @@ the sidebar's open/focus state to `~/.config/kilo/session`. The next launch
 restores that session, then opens any paths passed on the command line. Session
 state stores file paths and positions; unsaved buffer contents are not checkpointed.
 
-The command menu (`ctrl+;`) includes `plugins on` and `plugins off`, which change
-the persistent setting. Plugin scripts are regular Lua 5.4 with
-the standard libraries enabled.
+Use `plugins on` or `plugins off` in the command menu to change the persistent
+setting. Plugin scripts are regular Lua 5.4 with the standard libraries enabled.
 
 Plugins use the global `kilo` table. For example, `kilo.bind("ctrl+shift+w",
 function() ... end)` binds a callback; returning `false` lets Kilo's built-in
