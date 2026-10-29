@@ -51,6 +51,8 @@ int key_from_name(const char *name) {
 	if (!strcmp(key, "ctrl+enter")) return K_CTRL_ENTER;
 	if (!strcmp(key, "ctrl+backspace")) return K_CTRL_BACKSPACE;
 	if (!strcmp(key, "alt+backspace")) return K_ALT_BACKSPACE;
+	if (!strcmp(key, "alt+left")) return K_ALT_LEFT;
+	if (!strcmp(key, "alt+right")) return K_ALT_RIGHT;
 	if (!strcmp(key, "alt+g")) return K_HELP;
 	if (!strcmp(key, "up")) return K_UP;
 	if (!strcmp(key, "down")) return K_DOWN;
@@ -109,6 +111,8 @@ int r_key(void) {
 			// leading key and modifier values without requiring the suffix.
 			if (sscanf(seq, "[%d;%d", &key, &mod) == 2 ||
 			    sscanf(seq, "[%d:%*d;%d", &key, &mod) == 2) {
+				if ((mod == 3 || mod == 7) && key == 57350) return K_ALT_LEFT;
+				if ((mod == 3 || mod == 7) && key == 57351) return K_ALT_RIGHT;
 				if ((mod == 5 || mod == 7) && (key == 8 || key == 127)) return K_CTRL_BACKSPACE;
 				if ((mod == 3 || mod == 7) && key == 127) return K_ALT_BACKSPACE;
 				// Kitty keyboard protocol functional key codes for Left/Right.
@@ -172,16 +176,17 @@ int r_key(void) {
 					return 0;
 				} else if (b == 0 && mtype == 'M') {
 					// left click
+					if (tabs_mouse_click(mx, my)) return 0;
 					if (side && mx <= side) {
 						word_drag_active = 0;
 						last_word_click_valid = 0;
-						sidebar_mouse_click(my - 1);
+						sidebar_mouse_click(my - 2);
 						return 0;
 					}
 					sidebar_blur();
 					int width = g.w - gutter;
 					if (width < 1) width = 1;
-					cursor_from_screen(my - 1, mx - 1, width, gutter);
+					cursor_from_screen(my - 2, mx - 1, width, gutter);
 					g.sx = -1;
 					g.sy = -1;
 					int start, end, clicked;
@@ -210,7 +215,7 @@ int r_key(void) {
 					if (side && mx <= side) {
 						word_drag_active = 0;
 						last_word_click_valid = 0;
-						sidebar_mouse_drag(my - 1);
+						sidebar_mouse_drag(my - 2);
 						return 0;
 					}
 					sidebar_blur();
@@ -221,7 +226,7 @@ int r_key(void) {
 					}
 					int width = g.w - gutter;
 					if (width < 1) width = 1;
-					cursor_from_screen(my - 1, mx - 1, width, gutter);
+					cursor_from_screen(my - 2, mx - 1, width, gutter);
 					if (word_drag_active)
 						mouse_extend_word_selection(word_drag_start, word_drag_end, word_drag_click);
 					return 0;
@@ -253,9 +258,11 @@ int r_key(void) {
 			// parameter (CSI 1;6;D) instead of using CSI 1;6D.
 			int p1 = 0, p2 = 0;
 			char p3 = 0;
-			if (sscanf(seq, "[%d;%d;%c", &p1, &p2, &p3) == 3 && p1 == 1 && p2 == 6) {
-				if (p3 == 'D') return K_CTRL_SHIFT_LEFT;
-				if (p3 == 'C') return K_CTRL_SHIFT_RIGHT;
+			if (sscanf(seq, "[%d;%d;%c", &p1, &p2, &p3) == 3 && p1 == 1) {
+				if (p2 == 3 && p3 == 'D') return K_ALT_LEFT;
+				if (p2 == 3 && p3 == 'C') return K_ALT_RIGHT;
+				if (p2 == 6 && p3 == 'D') return K_CTRL_SHIFT_LEFT;
+				if (p2 == 6 && p3 == 'C') return K_CTRL_SHIFT_RIGHT;
 			}
 			if (!strcmp(seq, "[1;6D")) return K_CTRL_SHIFT_LEFT;
 			if (!strcmp(seq, "[1;6C")) return K_CTRL_SHIFT_RIGHT;
@@ -263,6 +270,8 @@ int r_key(void) {
 			int key = 0, mod = 0;
 			char final = 0;
 			if (sscanf(seq, "[%d;%d%c", &key, &mod, &final) == 3) {
+				if ((mod == 3 || mod == 7) && final == 'D') return K_ALT_LEFT;
+				if ((mod == 3 || mod == 7) && final == 'C') return K_ALT_RIGHT;
 				if ((mod == 5 || mod == 7) && key == 5 && final == '~') return K_CTRL_PGUP;
 				if ((mod == 5 || mod == 7) && key == 6 && final == '~') return K_CTRL_PGDN;
 				if (mod == 5 && final == 'D') return K_CTRL_LEFT;

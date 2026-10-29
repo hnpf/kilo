@@ -16,7 +16,30 @@
 #include "editor.h"
 
 #define KILO_VER "0.1.2"
+#define INITIAL_EDITOR_TABS 8
+#define UNDO_BUDGET (64u * 1024u * 1024u)
+#define TOTAL_UNDO_BUDGET (256u * 1024u * 1024u)
 struct s g;
+
+struct tab_buffer {
+	int cx, cy, sx, sy, pref_cx, rowoff, coloff, nr, r_cap;
+	struct r *r;
+	char *fn;
+	char search[128];
+	int search_on, dirty;
+	size_t file_sz;
+	struct snap u_stack[128];
+	int u_len;
+	struct snap r_stack[128];
+	int r_len;
+	size_t history_bytes;
+	int history_disabled;
+};
+
+static struct tab_buffer *editor_tabs;
+static int editor_tab_count, editor_tab_capacity, editor_tab_current, editor_tab_scroll;
+static size_t history_total_bytes;
+static uint64_t history_serial;
 
 void err(const char *m) {
 	perror(m);
@@ -112,7 +135,7 @@ void wsz(void) {
 		err("ioctl winsz");
 	}
 	g.w = ws.ws_col;
-	g.h = ws.ws_row - 2; // room for status bar + msg
+	g.h = ws.ws_row - 3; // room for tab bar, status bar, and msg
 }
 
 void msg(const char *fmt, ...) {
@@ -123,15 +146,22 @@ void msg(const char *fmt, ...) {
 	g.msg_t = time(NULL);
 }
 
-static void snap_free(struct snap *s) {
+static void snap_dispose(struct snap *s) {
 	free(s->data);
 	free(s->r);
-	if (s->bytes <= g.history_bytes) g.history_bytes -= s->bytes;
-	else g.history_bytes = 0;
 	s->r = NULL;
 	s->data = NULL;
 	s->nr = 0;
 	s->bytes = 0;
+	s->serial = 0;
+}
+
+static void snap_free(struct snap *s) {
+	if (s->serial) {
+		g.history_bytes = s->bytes <= g.history_bytes ? g.history_bytes - s->bytes : 0;
+		history_total_bytes = s->bytes <= history_total_bytes ? history_total_bytes - s->bytes : 0;
+	}
+	snap_dispose(s);
 }
 
 static size_t doc_mem_usage(void) {
@@ -140,8 +170,6 @@ static size_t doc_mem_usage(void) {
 	return bytes;
 }
 
-#define UNDO_BUDGET (64u * 1024u * 1024u)
-
 static void evict_oldest(struct snap *stack, int *len) {
 	if (*len <= 0) return;
 	snap_free(&stack[0]);
@@ -149,19 +177,77 @@ static void evict_oldest(struct snap *stack, int *len) {
 	(*len)--;
 }
 
+static void evict_inactive_oldest(struct tab_buffer *tab, struct snap *stack, int *len) {
+	if (*len <= 0) return;
+	struct snap *old = &stack[0];
+	if (old->serial) {
+		tab->history_bytes = old->bytes <= tab->history_bytes ? tab->history_bytes - old->bytes : 0;
+		history_total_bytes = old->bytes <= history_total_bytes ? history_total_bytes - old->bytes : 0;
+	}
+	snap_dispose(old);
+	memmove(stack, stack + 1, sizeof(*stack) * (size_t)(*len - 1));
+	(*len)--;
+}
+
+static int evict_global_oldest(void) {
+	uint64_t oldest = UINT64_MAX;
+	int owner = -1, redo = 0;
+	if (g.u_len > 0 && g.u_stack[0].serial < oldest) {
+		oldest = g.u_stack[0].serial; owner = -1; redo = 0;
+	}
+	if (g.r_len > 0 && g.r_stack[0].serial < oldest) {
+		oldest = g.r_stack[0].serial; owner = -1; redo = 1;
+	}
+	for (int i = 0; i < editor_tab_count; i++) {
+		if (i == editor_tab_current) continue;
+		struct tab_buffer *tab = &editor_tabs[i];
+		if (tab->u_len > 0 && tab->u_stack[0].serial < oldest) {
+			oldest = tab->u_stack[0].serial; owner = i; redo = 0;
+		}
+		if (tab->r_len > 0 && tab->r_stack[0].serial < oldest) {
+			oldest = tab->r_stack[0].serial; owner = i; redo = 1;
+		}
+	}
+	if (oldest == UINT64_MAX) return 0;
+	if (owner < 0) {
+		if (redo) evict_oldest(g.r_stack, &g.r_len);
+		else evict_oldest(g.u_stack, &g.u_len);
+	} else {
+		struct tab_buffer *tab = &editor_tabs[owner];
+		if (redo) evict_inactive_oldest(tab, tab->r_stack, &tab->r_len);
+		else evict_inactive_oldest(tab, tab->u_stack, &tab->u_len);
+	}
+	return 1;
+}
+
 static void push_history(struct snap *stack, int *len, struct snap s) {
-	while (g.history_bytes + s.bytes > UNDO_BUDGET) {
+	while (s.bytes > UNDO_BUDGET || g.history_bytes > UNDO_BUDGET - s.bytes) {
+		if (s.bytes > UNDO_BUDGET) {
+			snap_dispose(&s);
+			g.history_disabled = 1;
+			return;
+		}
 		if (g.u_len > 0) evict_oldest(g.u_stack, &g.u_len);
 		else if (g.r_len > 0) evict_oldest(g.r_stack, &g.r_len);
 		else {
-			snap_free(&s);
+			snap_dispose(&s);
+			g.history_disabled = 1;
+			return;
+		}
+	}
+	while (s.bytes > TOTAL_UNDO_BUDGET || history_total_bytes > TOTAL_UNDO_BUDGET - s.bytes) {
+		if (s.bytes > TOTAL_UNDO_BUDGET || !evict_global_oldest()) {
+			snap_dispose(&s);
 			g.history_disabled = 1;
 			return;
 		}
 	}
 	if (*len >= 128) evict_oldest(stack, len);
+	s.serial = ++history_serial;
+	if (!s.serial) s.serial = ++history_serial;
 	stack[(*len)++] = s;
 	g.history_bytes += s.bytes;
+	history_total_bytes += s.bytes;
 }
 
 static void snap_clear_redo(void) {
@@ -371,6 +457,309 @@ int editor_open_file(const char *fn) {
 	g.msg[0] = '\0';
 	g.msg_t = 0;
 	return 1;
+}
+
+static void store_active_tab(void) {
+	if (editor_tab_current < 0 || editor_tab_current >= editor_tab_count) return;
+	struct tab_buffer *tab = &editor_tabs[editor_tab_current];
+	tab->cx = g.cx; tab->cy = g.cy; tab->sx = g.sx; tab->sy = g.sy;
+	tab->pref_cx = g.pref_cx; tab->rowoff = g.rowoff; tab->coloff = g.coloff;
+	tab->nr = g.nr; tab->r_cap = g.r_cap; tab->r = g.r; tab->fn = g.fn;
+	memcpy(tab->search, g.search, sizeof(tab->search));
+	tab->search_on = g.search_on; tab->dirty = g.dirty; tab->file_sz = g.file_sz;
+	memcpy(tab->u_stack, g.u_stack, sizeof(tab->u_stack));
+	tab->u_len = g.u_len;
+	memcpy(tab->r_stack, g.r_stack, sizeof(tab->r_stack));
+	tab->r_len = g.r_len;
+	tab->history_bytes = g.history_bytes;
+	tab->history_disabled = g.history_disabled;
+}
+
+static void restore_tab(int index) {
+	struct tab_buffer *tab = &editor_tabs[index];
+	g.cx = tab->cx; g.cy = tab->cy; g.sx = tab->sx; g.sy = tab->sy;
+	g.pref_cx = tab->pref_cx; g.rowoff = tab->rowoff; g.coloff = tab->coloff;
+	g.nr = tab->nr; g.r_cap = tab->r_cap; g.r = tab->r; g.fn = tab->fn;
+	memcpy(g.search, tab->search, sizeof(g.search));
+	g.search_on = tab->search_on; g.dirty = tab->dirty; g.file_sz = tab->file_sz;
+	memcpy(g.u_stack, tab->u_stack, sizeof(g.u_stack));
+	g.u_len = tab->u_len;
+	memcpy(g.r_stack, tab->r_stack, sizeof(g.r_stack));
+	g.r_len = tab->r_len;
+	g.history_bytes = tab->history_bytes;
+	g.history_disabled = tab->history_disabled;
+	g.in_type = 0;
+}
+
+static void init_tab_buffer(struct tab_buffer *tab) {
+	memset(tab, 0, sizeof(*tab));
+	tab->sx = tab->sy = -1;
+	tab->pref_cx = -1;
+}
+
+static void tab_title(int index, char title[20]) {
+	const char *name = index == editor_tab_current ? g.fn : editor_tabs[index].fn;
+	if (!name) name = "[no name]";
+	else {
+		const char *base = strrchr(name, '/');
+		if (base && base[1]) name = base + 1;
+	}
+	int used = 0;
+	int limit = g.w > 4 ? g.w - 4 : 1;
+	if (limit > 18) limit = 18;
+	const unsigned char *p = (const unsigned char *)name;
+	for (; *p && used < limit;) {
+		if (*p < 0x80) {
+			title[used++] = *p >= 32 && *p < 127 ? (char)*p : '?';
+			p++;
+		} else {
+			int bytes = (*p >= 0xc2 && *p <= 0xdf) ? 2 :
+				(*p >= 0xe0 && *p <= 0xef) ? 3 : (*p >= 0xf0 && *p <= 0xf4) ? 4 : 1;
+			title[used++] = '?';
+			p++;
+			while (bytes-- > 1 && (*p & 0xc0) == 0x80) p++;
+		}
+	}
+	if (*p && limit >= 3) {
+		used = limit - 3;
+		memcpy(title + used, "...", 3);
+		used += 3;
+	}
+	title[used] = '\0';
+}
+
+static int tab_chip_width(int index) {
+	char title[20];
+	tab_title(index, title);
+	return (int)strlen(title) + 4; // leading space, title, space, close mark, trailing space
+}
+
+static void ensure_active_tab_visible(void) {
+	if (editor_tab_current < editor_tab_scroll) editor_tab_scroll = editor_tab_current;
+	int width = 0;
+	for (int i = editor_tab_scroll; i <= editor_tab_current && i < editor_tab_count; i++)
+		width += tab_chip_width(i);
+	while (width > g.w && editor_tab_scroll < editor_tab_current)
+		width -= tab_chip_width(editor_tab_scroll++);
+}
+
+static int same_tab_path(const char *a, const char *b) {
+	char real_a[4096], real_b[4096];
+	if (realpath(a, real_a) && realpath(b, real_b)) return !strcmp(real_a, real_b);
+	return !strcmp(a, b);
+}
+
+static int find_tab_path(const char *path) {
+	for (int i = 0; i < editor_tab_count; i++) {
+		const char *tab_path = i == editor_tab_current ? g.fn : editor_tabs[i].fn;
+		if (tab_path && same_tab_path(tab_path, path)) return i;
+	}
+	return -1;
+}
+
+static void switch_tab(int index) {
+	if (index < 0 || index >= editor_tab_count || index == editor_tab_current) return;
+	store_active_tab();
+	editor_tab_current = index;
+	restore_tab(index);
+	g.text_gen++;
+	g.msg[0] = '\0';
+	g.quit_warn = 0;
+	ensure_active_tab_visible();
+}
+
+static int ensure_tab_capacity(void) {
+	if (editor_tab_count < editor_tab_capacity) return 1;
+	int capacity = editor_tab_capacity ? editor_tab_capacity * 2 : INITIAL_EDITOR_TABS;
+	if (capacity <= editor_tab_capacity || (size_t)capacity > SIZE_MAX / sizeof(*editor_tabs)) return 0;
+	struct tab_buffer *tabs = realloc(editor_tabs, sizeof(*editor_tabs) * (size_t)capacity);
+	if (!tabs) return 0;
+	memset(tabs + editor_tab_capacity, 0,
+		sizeof(*tabs) * (size_t)(capacity - editor_tab_capacity));
+	editor_tabs = tabs;
+	editor_tab_capacity = capacity;
+	return 1;
+}
+
+void tabs_init(void) {
+	editor_tabs = calloc(INITIAL_EDITOR_TABS, sizeof(*editor_tabs));
+	if (!editor_tabs) err("allocate tabs");
+	editor_tab_capacity = INITIAL_EDITOR_TABS;
+	editor_tab_count = 1;
+	editor_tab_current = editor_tab_scroll = 0;
+	store_active_tab();
+}
+
+static void add_empty_tab(void) {
+	if (!ensure_tab_capacity()) {
+		msg("could not allocate a tab");
+		return;
+	}
+	store_active_tab();
+	int index = editor_tab_count++;
+	init_tab_buffer(&editor_tabs[index]);
+	editor_tab_current = index;
+	restore_tab(index);
+	g.text_gen++;
+	g.msg[0] = '\0';
+	g.quit_warn = 0;
+	ensure_active_tab_visible();
+}
+
+int tabs_open_file(const char *path) {
+	int existing = find_tab_path(path);
+	if (existing >= 0) {
+		switch_tab(existing);
+		return 1;
+	}
+	if (!g.fn && !g.dirty && g.nr == 0 && g.u_len == 0) {
+		int opened = editor_open_file(path);
+		if (opened) { store_active_tab(); ensure_active_tab_visible(); }
+		return opened;
+	}
+	if (!ensure_tab_capacity()) {
+		msg("could not allocate a tab");
+		return 0;
+	}
+	store_active_tab();
+	int index = editor_tab_count++;
+	init_tab_buffer(&editor_tabs[index]);
+	editor_tab_current = index;
+	restore_tab(index);
+	int opened = editor_open_file(path);
+	if (!opened) {
+		memset(&editor_tabs[index], 0, sizeof(editor_tabs[index]));
+		editor_tab_count--;
+		editor_tab_current--;
+		restore_tab(editor_tab_current);
+		return 0;
+	}
+	store_active_tab();
+	g.text_gen++;
+	ensure_active_tab_visible();
+	return 1;
+}
+
+static void free_tab_buffer(struct tab_buffer *tab) {
+	for (int i = 0; i < tab->nr; i++) free(tab->r[i].s);
+	free(tab->r);
+	free(tab->fn);
+	history_total_bytes = tab->history_bytes <= history_total_bytes ?
+		history_total_bytes - tab->history_bytes : 0;
+	for (int i = 0; i < tab->u_len; i++) {
+		free(tab->u_stack[i].data);
+		free(tab->u_stack[i].r);
+	}
+	for (int i = 0; i < tab->r_len; i++) {
+		free(tab->r_stack[i].data);
+		free(tab->r_stack[i].r);
+	}
+	memset(tab, 0, sizeof(*tab));
+}
+
+static int close_tab(int index) {
+	if (index < 0 || index >= editor_tab_count) return 0;
+	int original_active = editor_tab_current;
+	int closing_active = index == original_active;
+	if (index != editor_tab_current) switch_tab(index);
+	if (g.dirty) {
+		msg("Save changes before closing tab? y: save, n: discard, esc: cancel");
+		rfsh();
+		int answer = r_key();
+		if (answer == 'y' || answer == 'Y') {
+			sav();
+			if (g.dirty) {
+				char failure[sizeof(g.msg)];
+				snprintf(failure, sizeof(failure), "%s", g.msg);
+				if (!closing_active) switch_tab(original_active);
+				msg("%s", failure);
+				return 0;
+			}
+		} else if (answer != 'n' && answer != 'N') {
+			if (!closing_active) switch_tab(original_active);
+			msg("");
+			return 0;
+		}
+	}
+	store_active_tab();
+	free_tab_buffer(&editor_tabs[index]);
+	for (int i = index; i + 1 < editor_tab_count; i++) editor_tabs[i] = editor_tabs[i + 1];
+	memset(&editor_tabs[editor_tab_count - 1], 0, sizeof(editor_tabs[0]));
+	editor_tab_count--;
+	if (editor_tab_count == 0) {
+		editor_tab_count = 1;
+		editor_tab_current = editor_tab_scroll = 0;
+		init_tab_buffer(&editor_tabs[0]);
+		restore_tab(0);
+	} else {
+		if (closing_active) editor_tab_current = index < editor_tab_count ? index : editor_tab_count - 1;
+		else editor_tab_current = original_active > index ? original_active - 1 : original_active;
+		restore_tab(editor_tab_current);
+	}
+	g.text_gen++;
+	g.msg[0] = '\0';
+	g.quit_warn = 0;
+	ensure_active_tab_visible();
+	return 1;
+}
+
+int tabs_handle_key(int key) {
+	if (key == ('t' & 0x1f)) { add_empty_tab(); return 1; }
+	if (key == ('w' & 0x1f)) { close_tab(editor_tab_current); return 1; }
+	if (key == K_ALT_LEFT || key == K_PLUGIN_ALT_BASE + 'l') {
+		if (editor_tab_count > 1) switch_tab((editor_tab_current + editor_tab_count - 1) % editor_tab_count);
+		return 1;
+	}
+	if (key == K_ALT_RIGHT || key == K_PLUGIN_ALT_BASE + 'r') {
+		if (editor_tab_count > 1) switch_tab((editor_tab_current + 1) % editor_tab_count);
+		return 1;
+	}
+	return 0;
+}
+
+int tabs_mouse_click(int screen_col, int screen_row) {
+	if (screen_row != 1 || editor_tab_count <= 0) return 0;
+	ensure_active_tab_visible();
+	int col = 1;
+	for (int i = editor_tab_scroll; i < editor_tab_count; i++) {
+		char title[20];
+		tab_title(i, title);
+		int title_width = (int)strlen(title);
+		int width = title_width + 4;
+		if (col + width - 1 > g.w) break;
+		int close_col = col + title_width + 2;
+		if (screen_col >= col && screen_col < col + width) {
+			if (screen_col == close_col) close_tab(i);
+			else switch_tab(i);
+			return 1;
+		}
+		col += width;
+	}
+	return 1;
+}
+
+void tabs_render(struct b *b) {
+	char pos[] = "\x1b[1;1H";
+	b_add(b, pos, sizeof(pos) - 1);
+	th_bg(b);
+	th_fg(b);
+	ensure_active_tab_visible();
+	int col = 1;
+	for (int i = editor_tab_scroll; i < editor_tab_count; i++) {
+		char title[20];
+		tab_title(i, title);
+		int width = (int)strlen(title) + 4;
+		if (col + width - 1 > g.w) break;
+		if (i == editor_tab_current) b_add(b, "\x1b[7m", 4);
+		b_add(b, " ", 1);
+		b_add(b, title, strlen(title));
+		b_add(b, " x ", 3);
+		if (i == editor_tab_current) b_add(b, "\x1b[0m", 4);
+		col += width;
+	}
+	th_bg(b);
+	while (col <= g.w) { b_add(b, " ", 1); col++; }
+	b_add(b, "\x1b[K", 3);
 }
 
 static char *prmpt(const char *prompt_str);
@@ -773,6 +1162,7 @@ void rfsh(void) {
 	// apply theme bg & fg
 	th_bg(&b);
 	th_fg(&b);
+	tabs_render(&b);
 
 	// selection ANSI
 	int r, gr, bl;
@@ -795,7 +1185,7 @@ void rfsh(void) {
 	// draw file lines
 	for (int y = 0; y < g.h; y++) {
 		char rowpos[32];
-		int rowlen = snprintf(rowpos, sizeof(rowpos), "\x1b[%d;1H", y + 1);
+		int rowlen = snprintf(rowpos, sizeof(rowpos), "\x1b[%d;1H", y + 2);
 		b_add(&b, rowpos, rowlen);
 		int filerow, segment = 0;
 		int segstart = g.coloff, segend = 0, visual_col = 0;
@@ -918,7 +1308,7 @@ void rfsh(void) {
 
 	// status bar (inverted colors / file info)
 	char statuspos[32];
-	int statusposlen = snprintf(statuspos, sizeof(statuspos), "\x1b[%d;1H", g.h + 1);
+	int statusposlen = snprintf(statuspos, sizeof(statuspos), "\x1b[%d;1H", g.h + 2);
 	b_add(&b, statuspos, statusposlen);
 	b_add(&b, "\x1b[7m", 4);
 	char status[128], rstatus[128];
@@ -946,7 +1336,7 @@ void rfsh(void) {
 
 	// status message line (padded with theme bg)
 	char msgpos[32];
-	int msgposlen = snprintf(msgpos, sizeof(msgpos), "\x1b[%d;1H", g.h + 2);
+	int msgposlen = snprintf(msgpos, sizeof(msgpos), "\x1b[%d;1H", g.h + 3);
 	b_add(&b, msgpos, msgposlen);
 	th_bg(&b);
 	th_fg(&b);
@@ -984,7 +1374,7 @@ void rfsh(void) {
 			cx += g.cx - g.coloff;
 		cy = g.cy - g.rowoff;
 	}
-	int curlen = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cy + 1, cx + 1);
+	int curlen = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cy + 2, cx + 1);
 	b_add(&b, buf, curlen);
 
 	// Keep the editor cursor out of sight while keyboard focus is in the sidebar.
@@ -1708,13 +2098,18 @@ int main(int argc, char **argv) {
 	if (argc >= 2) {
 		editor_open_file(argv[1]);
 	}
+	tabs_init();
 	sidebar_init(argc < 2);
-	msg("ctrl-s: save | ctrl-z/y: undo/redo | ctrl-g: help | ctrl-;: menu");
+	msg("ctrl-s: save | ctrl-z/y: undo/redo | ctrl-t/w: tabs | ctrl-;: menu");
 	plugins_load();
 
 	while (1) {
 		rfsh();
 		int c = r_key();
+		if (tabs_handle_key(c)) {
+			g.quit_warn = 0;
+			continue;
+		}
 		if (sidebar_has_focus() && sidebar_handle_key(c)) {
 			g.quit_warn = 0;
 			continue;

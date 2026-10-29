@@ -54,12 +54,14 @@ void show_help(void) {
 			"│   menus & help                                      │",
 			"│   ctrl+;    cmd / themes       ctrl+g   help        │",
 			"│   ctrl+b    toggle file sidebar                    │",
+			"│   ctrl+t    new tab          ctrl+w close tab       │",
+			"│   alt+left/right   switch tabs  | click x to close  │",
 			"│   alt+g     keybindings        ctrl+q   quit        │",
 			"│                                                     │",
 			"└─────────────────────────────────────────────────────┘"
 		};
 		int nlines = sizeof(lines) / sizeof(lines[0]);
-		int total_h = g.h + 2;
+		int total_h = g.h + 3;
 		int start_y = (total_h > nlines) ? (total_h - nlines) / 2 + 1 : 1;
 
 		int r, gr, bl;

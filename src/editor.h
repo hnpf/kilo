@@ -35,6 +35,8 @@ enum k {
 	K_CTRL_ENTER,
 	K_CTRL_PGUP,
 	K_CTRL_PGDN,
+	K_ALT_LEFT,
+	K_ALT_RIGHT,
 	K_CTRL_BACKSPACE,
 	K_ALT_BACKSPACE,
 	K_PLUGIN_CTRL_SHIFT_BASE = 1200,
@@ -48,7 +50,7 @@ struct th {
 	char name[32], bg[32], fg[32], sel[32], ln[32], cur_ln[32];
 	char keyword[32], function[32], string[32], number[32], comment[32];
 };
-struct snap { int nr; struct r *r; char *data; int cx, cy; size_t bytes; };
+struct snap { int nr; struct r *r; char *data; int cx, cy; size_t bytes; uint64_t serial; };
 
 struct s {
 	struct termios o;
@@ -125,5 +127,10 @@ int sidebar_mouse_click(int screen_row);
 int sidebar_mouse_drag(int screen_row);
 void sidebar_render_row(struct b *b, int screen_row);
 int editor_open_file(const char *path);
+void tabs_init(void);
+int tabs_open_file(const char *path);
+int tabs_handle_key(int key);
+int tabs_mouse_click(int screen_col, int screen_row);
+void tabs_render(struct b *b);
 
 #endif

@@ -396,7 +396,7 @@ static void activate_selected(void) {
 		if (selected >= 0 && selected < search_result_count) {
 			struct search_result *result = &search_results[selected];
 			int file = result->file;
-			if (file >= 0 && file < search_file_count && editor_open_file(search_files[file].path) && result->content) {
+			if (file >= 0 && file < search_file_count && tabs_open_file(search_files[file].path) && result->content) {
 				g.cy = result->line ? (int)(result->line - 1) : 0;
 				if (g.cy >= g.nr) g.cy = g.nr ? g.nr - 1 : 0;
 				g.cx = g.cy < g.nr ? (int)result->column : 0;
@@ -414,7 +414,7 @@ static void activate_selected(void) {
 		node->expanded = !node->expanded;
 		rebuild_visible();
 	} else {
-		editor_open_file(node->path);
+		tabs_open_file(node->path);
 	}
 }
 
@@ -538,7 +538,7 @@ int sidebar_handle_key(int key) {
 		return 1;
 	}
 	if (search_query[0]) {
-		if (key == K_CTRL_BACKSPACE || key == K_ALT_BACKSPACE || key == 23) {
+		if (key == K_CTRL_BACKSPACE || key == K_ALT_BACKSPACE) {
 			delete_query_word_left();
 			return 1;
 		}
@@ -567,7 +567,7 @@ int sidebar_handle_key(int key) {
 		keep_selection_visible_count(search_result_count);
 		return 1;
 	}
-	if (key == K_CTRL_BACKSPACE || key == K_ALT_BACKSPACE || key == 23 ||
+	if (key == K_CTRL_BACKSPACE || key == K_ALT_BACKSPACE ||
 		key == K_BACKSPACE || key == K_DEL || key == 8 || key == 127) return 1;
 	if (key >= 32 && key < 127) { edit_query(0, 0, key); return 1; }
 	rebuild_visible();

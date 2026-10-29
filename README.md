@@ -37,6 +37,10 @@ at the match. Ctrl+left/right move by word, Ctrl+backspace deletes the previous
 word, and Escape clears the search. Toggle the sidebar with `ctrl+b` or
 `ctrl+;` → `sidebar`.
 
+Tabs open from the top bar. Use `ctrl+t` for a new tab, `ctrl+w` or a tab's `x`
+to close it, and `alt+left` / `alt+right` (or `alt+l` / `alt+r`) to switch tabs.
+Opening a file from the sidebar selects its existing tab or opens it in a new one.
+
 The command menu (`ctrl+;`) includes `plugins on` and `plugins off`, which change
 the persistent setting. Plugin scripts are regular Lua 5.4 with
 the standard libraries enabled.
