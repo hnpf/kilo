@@ -511,6 +511,10 @@ static int sidebar_item_count(void) {
 	return search_query[0] ? search_result_count : visible_count;
 }
 
+static int sidebar_passthrough_key(int key) {
+	return key == K_CMD || key == K_HELP || key == ('s' & 0x1f) || key == ('q' & 0x1f);
+}
+
 int sidebar_handle_key(int key) {
 	if (key == ('b' & 0x1f)) {
 		is_open = !is_open;
@@ -558,7 +562,8 @@ int sidebar_handle_key(int key) {
 		else if (key == K_PGUP) selected -= g.h > 2 ? g.h - 2 : 1;
 		else if (key == K_PGDN) selected += g.h > 2 ? g.h - 2 : 1;
 		else if (key == '\r' || key == '\n') activate_selected();
-		else { is_focused = 0; return 0; }
+		else if (sidebar_passthrough_key(key)) return 0;
+		else return 1;
 		keep_selection_visible_count(search_result_count);
 		return 1;
 	}
@@ -589,10 +594,8 @@ int sidebar_handle_key(int key) {
 			node->parent->expanded = 0;
 			for (int i = 0; i < visible_count; i++) if (visible[i].node == node->parent) { selected = i; break; }
 		}
-	} else {
-		is_focused = 0;
-		return 0;
-	}
+	} else if (sidebar_passthrough_key(key)) return 0;
+	else return 1;
 	rebuild_visible();
 	return 1;
 }

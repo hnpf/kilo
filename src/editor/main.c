@@ -1715,6 +1715,10 @@ int main(int argc, char **argv) {
 	while (1) {
 		rfsh();
 		int c = r_key();
+		if (sidebar_has_focus() && sidebar_handle_key(c)) {
+			g.quit_warn = 0;
+			continue;
+		}
 		if (plugin_dispatch(c)) continue;
 		if (c >= K_PLUGIN_CTRL_SHIFT_BASE + 'a' && c <= K_PLUGIN_CTRL_SHIFT_BASE + 'z')
 			c = c - K_PLUGIN_CTRL_SHIFT_BASE - 'a' + 1;
