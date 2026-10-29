@@ -51,6 +51,11 @@ struct th {
 	char keyword[32], function[32], string[32], number[32], comment[32];
 };
 struct snap { int nr; struct r *r; char *data; int cx, cy; size_t bytes; uint64_t serial; };
+struct session_tab_state { char *path; int cx, cy, rowoff, coloff; };
+struct session_state {
+	int active, sidebar_open, sidebar_focused, tab_count;
+	struct session_tab_state *tabs;
+};
 
 struct s {
 	struct termios o;
@@ -65,6 +70,7 @@ struct s {
 	char plugin_dir[512];
 	int quit_warn, in_type;
 	size_t file_sz;
+	unsigned long buffer_gen;
 	struct th th;
 	struct snap u_stack[128]; int u_len;
 	struct snap r_stack[128]; int r_len;
@@ -76,6 +82,20 @@ struct s {
 extern struct s g;
 extern char g_themes[64][32];
 extern int g_nthemes;
+
+struct git_state;
+struct git_state *git_state_create(void);
+void git_state_destroy(struct git_state *state);
+void git_state_suspend(struct git_state *state);
+void git_state_refresh(struct git_state *state, unsigned long buffer_gen);
+char git_line_marker(const struct git_state *state, int line);
+const char *git_branch_name(const struct git_state *state);
+int git_state_enabled(const struct git_state *state);
+void session_save(void);
+int session_restore(int *sidebar_open, int *sidebar_focused);
+void session_state_free(struct session_state *state);
+int tabs_session_export(struct session_state *state);
+int tabs_session_import(const struct session_state *state);
 
 void msg(const char *fmt, ...);
 void err(const char *message);

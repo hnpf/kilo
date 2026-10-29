@@ -54,6 +54,7 @@ void show_help(void) {
 			"│   menus & help                                      │",
 			"│   ctrl+;    cmd / themes       ctrl+g   help        │",
 			"│   ctrl+b    toggle file sidebar                    │",
+			"│   git gutter: + added ~ modified - deleted          │",
 			"│   ctrl+t    new tab          ctrl+w close tab       │",
 			"│   alt+left/right   switch tabs  | click x to close  │",
 			"│   alt+g     keybindings        ctrl+q   quit        │",

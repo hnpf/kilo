@@ -34,12 +34,15 @@ struct tab_buffer {
 	int r_len;
 	size_t history_bytes;
 	int history_disabled;
+	unsigned long buffer_gen;
+	struct git_state *git;
 };
 
 static struct tab_buffer *editor_tabs;
 static int editor_tab_count, editor_tab_capacity, editor_tab_current, editor_tab_scroll;
 static size_t history_total_bytes;
 static uint64_t history_serial;
+static struct git_state *active_git_state;
 
 void err(const char *m) {
 	perror(m);
@@ -320,6 +323,7 @@ static void snap_restore(struct snap *s) {
 	}
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 static void undo(void) {
@@ -370,6 +374,7 @@ void add_r(int at, const char *s, size_t len) {
 	g.nr++;
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 static void del_r(int at) {
@@ -379,6 +384,7 @@ static void del_r(int at) {
 	g.nr--;
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 static void r_ins_c(struct r *row, int at, int c) {
@@ -389,6 +395,7 @@ static void r_ins_c(struct r *row, int at, int c) {
 	row->s[at] = c;
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 static void r_del_c(struct r *row, int at) {
@@ -397,6 +404,7 @@ static void r_del_c(struct r *row, int at) {
 	row->l--;
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 static void r_app_s(struct r *row, const char *s, size_t len) {
@@ -406,6 +414,7 @@ static void r_app_s(struct r *row, const char *s, size_t len) {
 	row->s[row->l] = '\0';
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 static void clear_history(void) {
@@ -442,6 +451,7 @@ int editor_open_file(const char *fn) {
 	g.search_on = 0;
 	g.in_type = 0;
 	g.text_gen++;
+	g.buffer_gen++;
 	struct stat st;
 	if (fstat(fileno(fp), &st) == 0 && st.st_size >= 0) g.file_sz = (size_t)st.st_size;
 	char *line = NULL;
@@ -473,6 +483,7 @@ static void store_active_tab(void) {
 	tab->r_len = g.r_len;
 	tab->history_bytes = g.history_bytes;
 	tab->history_disabled = g.history_disabled;
+	tab->buffer_gen = g.buffer_gen;
 }
 
 static void restore_tab(int index) {
@@ -488,6 +499,7 @@ static void restore_tab(int index) {
 	g.r_len = tab->r_len;
 	g.history_bytes = tab->history_bytes;
 	g.history_disabled = tab->history_disabled;
+	g.buffer_gen = tab->buffer_gen;
 	g.in_type = 0;
 }
 
@@ -495,6 +507,7 @@ static void init_tab_buffer(struct tab_buffer *tab) {
 	memset(tab, 0, sizeof(*tab));
 	tab->sx = tab->sy = -1;
 	tab->pref_cx = -1;
+	tab->git = git_state_create();
 }
 
 static void tab_title(int index, char title[20]) {
@@ -560,8 +573,10 @@ static int find_tab_path(const char *path) {
 static void switch_tab(int index) {
 	if (index < 0 || index >= editor_tab_count || index == editor_tab_current) return;
 	store_active_tab();
+	git_state_suspend(active_git_state);
 	editor_tab_current = index;
 	restore_tab(index);
+	active_git_state = editor_tabs[index].git;
 	g.text_gen++;
 	g.msg[0] = '\0';
 	g.quit_warn = 0;
@@ -587,6 +602,8 @@ void tabs_init(void) {
 	editor_tab_capacity = INITIAL_EDITOR_TABS;
 	editor_tab_count = 1;
 	editor_tab_current = editor_tab_scroll = 0;
+	editor_tabs[0].git = git_state_create();
+	active_git_state = editor_tabs[0].git;
 	store_active_tab();
 }
 
@@ -596,23 +613,25 @@ static void add_empty_tab(void) {
 		return;
 	}
 	store_active_tab();
+	git_state_suspend(active_git_state);
 	int index = editor_tab_count++;
 	init_tab_buffer(&editor_tabs[index]);
 	editor_tab_current = index;
 	restore_tab(index);
+	active_git_state = editor_tabs[index].git;
 	g.text_gen++;
 	g.msg[0] = '\0';
 	g.quit_warn = 0;
 	ensure_active_tab_visible();
 }
 
-int tabs_open_file(const char *path) {
+static int tabs_open_file_internal(const char *path, int reuse_blank) {
 	int existing = find_tab_path(path);
 	if (existing >= 0) {
 		switch_tab(existing);
 		return 1;
 	}
-	if (!g.fn && !g.dirty && g.nr == 0 && g.u_len == 0) {
+	if (reuse_blank && !g.fn && !g.dirty && g.nr == 0 && g.u_len == 0) {
 		int opened = editor_open_file(path);
 		if (opened) { store_active_tab(); ensure_active_tab_visible(); }
 		return opened;
@@ -622,16 +641,20 @@ int tabs_open_file(const char *path) {
 		return 0;
 	}
 	store_active_tab();
+	git_state_suspend(active_git_state);
 	int index = editor_tab_count++;
 	init_tab_buffer(&editor_tabs[index]);
 	editor_tab_current = index;
 	restore_tab(index);
+	active_git_state = editor_tabs[index].git;
 	int opened = editor_open_file(path);
 	if (!opened) {
+		git_state_destroy(editor_tabs[index].git);
 		memset(&editor_tabs[index], 0, sizeof(editor_tabs[index]));
 		editor_tab_count--;
 		editor_tab_current--;
 		restore_tab(editor_tab_current);
+		active_git_state = editor_tabs[editor_tab_current].git;
 		return 0;
 	}
 	store_active_tab();
@@ -640,10 +663,15 @@ int tabs_open_file(const char *path) {
 	return 1;
 }
 
+int tabs_open_file(const char *path) {
+	return tabs_open_file_internal(path, 1);
+}
+
 static void free_tab_buffer(struct tab_buffer *tab) {
 	for (int i = 0; i < tab->nr; i++) free(tab->r[i].s);
 	free(tab->r);
 	free(tab->fn);
+	git_state_destroy(tab->git);
 	history_total_bytes = tab->history_bytes <= history_total_bytes ?
 		history_total_bytes - tab->history_bytes : 0;
 	for (int i = 0; i < tab->u_len; i++) {
@@ -691,10 +719,12 @@ static int close_tab(int index) {
 		editor_tab_current = editor_tab_scroll = 0;
 		init_tab_buffer(&editor_tabs[0]);
 		restore_tab(0);
+		active_git_state = editor_tabs[0].git;
 	} else {
 		if (closing_active) editor_tab_current = index < editor_tab_count ? index : editor_tab_count - 1;
 		else editor_tab_current = original_active > index ? original_active - 1 : original_active;
 		restore_tab(editor_tab_current);
+		active_git_state = editor_tabs[editor_tab_current].git;
 	}
 	g.text_gen++;
 	g.msg[0] = '\0';
@@ -760,6 +790,78 @@ void tabs_render(struct b *b) {
 	th_bg(b);
 	while (col <= g.w) { b_add(b, " ", 1); col++; }
 	b_add(b, "\x1b[K", 3);
+}
+
+static void restore_session_view(int cx, int cy, int rowoff, int coloff) {
+	if (g.nr <= 0) { g.cx = g.cy = 0; }
+	else {
+		if (cy < 0) cy = 0;
+		if (cy >= g.nr) cy = g.nr - 1;
+		g.cy = cy;
+		if (cx < 0) cx = 0;
+		if (cx > g.r[g.cy].l) cx = g.r[g.cy].l;
+		g.cx = cx;
+	}
+	g.sx = g.sy = -1;
+	g.pref_cx = -1;
+	g.rowoff = rowoff > 0 ? rowoff : 0;
+	g.coloff = coloff > 0 ? coloff : 0;
+	g.in_type = 0;
+}
+
+int tabs_session_export(struct session_state *state) {
+	if (!state) return 0;
+	memset(state, 0, sizeof(*state));
+	state->active = editor_tab_current;
+	state->tab_count = editor_tab_count;
+	state->tabs = calloc((size_t)state->tab_count, sizeof(*state->tabs));
+	if (!state->tabs) { state->tab_count = 0; return 0; }
+	for (int i = 0; i < state->tab_count; i++) {
+		struct tab_buffer *tab = &editor_tabs[i];
+		const char *filename = i == editor_tab_current ? g.fn : tab->fn;
+		state->tabs[i].path = strdup(filename ? filename : "");
+		if (!state->tabs[i].path) { session_state_free(state); return 0; }
+		state->tabs[i].cx = i == editor_tab_current ? g.cx : tab->cx;
+		state->tabs[i].cy = i == editor_tab_current ? g.cy : tab->cy;
+		state->tabs[i].rowoff = i == editor_tab_current ? g.rowoff : tab->rowoff;
+		state->tabs[i].coloff = i == editor_tab_current ? g.coloff : tab->coloff;
+	}
+	return 1;
+}
+
+int tabs_session_import(const struct session_state *state) {
+	if (!state || state->tab_count < 1 || !state->tabs) return 0;
+	int initial_blank_used = 0, last_restored = -1, active_restored = -1, valid = 0;
+	for (int i = 0; i < state->tab_count; i++) {
+		const struct session_tab_state *saved = &state->tabs[i];
+		int opened = 0;
+		if (saved->path && saved->path[0]) {
+			int reuse_blank = !initial_blank_used && editor_tab_count == 1 &&
+				!g.fn && !g.dirty && g.nr == 0;
+			opened = tabs_open_file_internal(saved->path, reuse_blank);
+			if (opened && reuse_blank && g.fn) initial_blank_used = 1;
+		} else if (!initial_blank_used && editor_tab_count == 1 && !g.fn && !g.dirty && g.nr == 0) {
+			opened = 1;
+			initial_blank_used = 1;
+		} else {
+			int old_count = editor_tab_count;
+			add_empty_tab();
+			opened = editor_tab_count > old_count;
+		}
+		if (!opened) continue;
+		int tab_index = editor_tab_current;
+		restore_session_view(saved->cx, saved->cy, saved->rowoff, saved->coloff);
+		store_active_tab();
+		last_restored = tab_index;
+		valid++;
+		if (i == state->active) active_restored = tab_index;
+	}
+	if (valid > 0) {
+		if (active_restored < 0) active_restored = last_restored;
+		switch_tab(active_restored);
+		store_active_tab();
+	}
+	return valid;
 }
 
 static char *prmpt(const char *prompt_str);
@@ -922,6 +1024,7 @@ void del_sel(void) {
 	g.sx = -1;
 	g.dirty = 1;
 	g.text_gen++;
+	g.buffer_gen++;
 }
 
 void ins_c(int c) {
@@ -935,6 +1038,7 @@ void ins_c(int c) {
 		g.r[g.cy].s[g.cx] = c;
 		g.dirty = 1;
 		g.text_gen++;
+		g.buffer_gen++;
 	} else {
 		r_ins_c(&g.r[g.cy], g.cx, c);
 	}
@@ -1000,7 +1104,7 @@ int gutter_width(void) {
 	int ln_w = 1;
 	for (int n = g.nr; n >= 10; n /= 10) ln_w++;
 	if (ln_w < 3) ln_w = 3;
-	return ln_w + 3 + sidebar_width();
+	return ln_w + 3 + (git_state_enabled(active_git_state) ? 2 : 0) + sidebar_width();
 }
 
 // The document stores tabs as one byte, but the terminal displays each tab
@@ -1151,6 +1255,7 @@ static void scrl(void) {
 }
 
 void rfsh(void) {
+	git_state_refresh(active_git_state, g.buffer_gen);
 	scrl();
 	syntax_prepare();
 
@@ -1178,9 +1283,11 @@ void rfsh(void) {
 	int margin = gutter_width();
 	int side = sidebar_width();
 	int gutter = margin - side;
-	int ln_w = gutter - 3;
+	int git_gutter = git_state_enabled(active_git_state);
+	int ln_w = gutter - (git_gutter ? 5 : 3);
 	int text_w = g.w - margin;
 	if (text_w < 1) text_w = 1;
+	int eof_marker_drawn = 0;
 
 	// draw file lines
 	for (int y = 0; y < g.h; y++) {
@@ -1217,17 +1324,36 @@ void rfsh(void) {
 
 			char numbuf[32];
 			int nlen;
-			if (segment == 0) nlen = snprintf(numbuf, sizeof(numbuf), "%*d │ ", ln_w, filerow + 1);
-			else nlen = snprintf(numbuf, sizeof(numbuf), "%*s │ ", ln_w, "");
+			char marker = git_gutter && segment == 0 ? git_line_marker(active_git_state, filerow) : 0;
+			if (segment == 0) nlen = snprintf(numbuf, sizeof(numbuf), git_gutter ? "%*d " : "%*d │ ", ln_w, filerow + 1);
+			else nlen = snprintf(numbuf, sizeof(numbuf), git_gutter ? "%*s " : "%*s │ ", ln_w, "");
 			b_add(&b, numbuf, nlen);
+			if (git_gutter) {
+				if (marker == '+') b_add(&b, "\x1b[2;32m", 7);
+				else if (marker == '~') b_add(&b, "\x1b[2;33m", 7);
+				else if (marker == '-') b_add(&b, "\x1b[2;31m", 7);
+				b_add(&b, marker ? &marker : " ", 1);
+				b_add(&b, "\x1b[22m", 5);
+				th_fg(&b);
+				b_add(&b, " │ ", 5);
+			}
 			col_written += gutter;
-			th_fg(&b);
 		} else {
 			b_add(&b, "\x1b[90m", 5);
 			for (int p = 0; p < ln_w; p++) b_add(&b, " ", 1);
-			b_add(&b, " ~ ", 3);
+			if (git_gutter) {
+				b_add(&b, " ", 1);
+				char marker = git_line_marker(active_git_state, filerow);
+				if (filerow == g.nr && eof_marker_drawn) marker = 0;
+				if (filerow == g.nr) eof_marker_drawn = 1;
+				if (marker == '-') b_add(&b, "\x1b[2;31m", 7);
+				else if (!marker) { marker = '~'; b_add(&b, "\x1b[2;90m", 7); }
+				b_add(&b, marker ? &marker : " ", 1);
+				b_add(&b, "\x1b[22m", 5);
+				th_fg(&b);
+				b_add(&b, " │ ", 5);
+			} else b_add(&b, " ~ ", 3);
 			col_written += gutter;
-			th_fg(&b);
 		}
 
 		if (filerow >= g.nr) {
@@ -1312,11 +1438,14 @@ void rfsh(void) {
 	b_add(&b, statuspos, statusposlen);
 	b_add(&b, "\x1b[7m", 4);
 	char status[128], rstatus[128];
-	int len = snprintf(status, sizeof(status), " %.20s%s | %d lines, %zuB | unix (LF) | utf-8",
-		g.fn ? g.fn : "[no name]",
-		g.dirty ? " *" : "",
-		g.nr,
-		g.file_sz);
+	const char *branch = git_branch_name(active_git_state);
+	int len;
+	if (branch && branch[0])
+		len = snprintf(status, sizeof(status), " %.18s%s | %d lines | [%.20s]",
+			g.fn ? g.fn : "[no name]", g.dirty ? " *" : "", g.nr, branch);
+	else
+		len = snprintf(status, sizeof(status), " %.20s%s | %d lines, %zuB | unix (LF) | utf-8",
+			g.fn ? g.fn : "[no name]", g.dirty ? " *" : "", g.nr, g.file_sz);
 	int rlen = snprintf(rstatus, sizeof(rstatus), "ln %d, col %d [%s] %s %s",
 		g.cy + 1, g.cx + 1,
 		g.th.name[0] ? g.th.name : "base16",
@@ -2095,11 +2224,12 @@ int main(int argc, char **argv) {
 	raw();
 	wsz();
 
-	if (argc >= 2) {
-		editor_open_file(argv[1]);
-	}
 	tabs_init();
-	sidebar_init(argc < 2);
+	int restored_sidebar_open = 0, restored_sidebar_focus = 0;
+	int restored = session_restore(&restored_sidebar_open, &restored_sidebar_focus);
+	for (int i = 1; i < argc; i++) tabs_open_file(argv[i]);
+	sidebar_init(restored ? restored_sidebar_open : argc < 2);
+	if (restored && restored_sidebar_open && !restored_sidebar_focus) sidebar_blur();
 	msg("ctrl-s: save | ctrl-z/y: undo/redo | ctrl-t/w: tabs | ctrl-;: menu");
 	plugins_load();
 
@@ -2354,6 +2484,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	session_save();
 	plugins_close();
 	return 0;
 }

@@ -181,7 +181,7 @@ static int lua_set_text(lua_State *L) {
 		}
 	}
 	g.cx = g.cy = 0; g.sx = g.sy = -1; g.pref_cx = -1; g.in_type = 0;
-	g.dirty = 1; g.text_gen++;
+	g.dirty = 1; g.text_gen++; g.buffer_gen++;
 	return 0;
 }
 
@@ -197,7 +197,7 @@ static int lua_set_line(lua_State *L) {
 	g.r[line].s = malloc(len + 1);
 	memcpy(g.r[line].s, s, len); g.r[line].s[len] = '\0'; g.r[line].l = (int)len;
 	if (g.cy == line && g.cx > g.r[line].l) g.cx = g.r[line].l;
-	g.dirty = 1; g.text_gen++;
+	g.dirty = 1; g.text_gen++; g.buffer_gen++;
 	return 0;
 }
 

@@ -41,6 +41,16 @@ Tabs open from the top bar. Use `ctrl+t` for a new tab, `ctrl+w` or a tab's `x`
 to close it, and `alt+left` / `alt+right` (or `alt+l` / `alt+r`) to switch tabs.
 Opening a file from the sidebar selects its existing tab or opens it in a new one.
 
+When a file is inside a Git repository, the gutter compares the current buffer
+with `HEAD`: green `+` marks added lines, yellow `~` modified lines, and red `-`
+marks deletions at the next line (or the empty row after the file). The current
+branch appears in the status bar.
+
+On exit, Kilo saves file-backed tabs, their cursor and viewport positions, and
+the sidebar's open/focus state to `~/.config/kilo/session`. The next launch
+restores that session, then opens any paths passed on the command line. Session
+state stores file paths and positions; unsaved buffer contents are not checkpointed.
+
 The command menu (`ctrl+;`) includes `plugins on` and `plugins off`, which change
 the persistent setting. Plugin scripts are regular Lua 5.4 with
 the standard libraries enabled.
